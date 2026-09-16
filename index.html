@@ -832,8 +832,10 @@ function insideBust(x,y){
 /* Kopfringe. Benachbarte Punkte gleicher Farbstufe werden zu einem
    Linienstueck verschmolzen -> durchgehende Hoehenlinien wie im Original. */
 function drawHead(t,lvl){
-  const waveBase=0.42*U, waveHot=1.8*U;
-  const kx1=0.030/U, kx2=0.011/U;
+  /* Etwas hoehere Frequenz, etwas weniger Ausschlag im Glutzentrum - in der
+     Vorlage wirkt das Wellenmuster feiner/ruhiger, nicht so grobwellig. */
+  const waveBase=0.42*U, waveHot=1.5*U;
+  const kx1=0.038/U, kx2=0.014/U;
   for(let i=0;i<headRows.length;i++){
     const R=headRows[i];
     const w1=t*2.6+R.t*2.4+R.ph*0.25, w2=-t*1.15+R.t*1.6;
