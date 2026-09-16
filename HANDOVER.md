@@ -76,6 +76,61 @@ Arme, Schultergelenk und die Zweiknochen-IK sind **raus** — nur noch Hände.
   `?hand=0.85` staucht, falls die Hände zu weit nach außen laufen.
 - Handerkennung läuft jedes Bild, solange eine Hand sichtbar ist, sonst jedes dritte.
 
+## Bildabgleich gegen die Vorlage (2026-09-16, Runde 2)
+Domi schickte ein zweites, viel saubereres Referenzvideo: `_Eingang/humanoid-demo.mp4`
+(37s, 1918x1198, echter Screen-Recording statt Handyaufnahme vom Monitor). Die
+macOS-Dateimetadaten (`mdls -raw -name kMDItemWhereFroms`) verraten die Herkunft:
+`reznikov-engineering.com/apex/humanoid/buy` — ein **bezahltes Produkt** ("Apex
+Humanoid"), keine freie Vorlage. Deshalb: kein Scraping/Download von deren Seite,
+keine Quellcode-Uebernahme — nur den *Look* aus den Videobildern abmessen und mit
+eigenem Code nachbauen, wie schon beim ersten Instagram-Reel.
+
+Frames wurden mit AVFoundation/Swift extrahiert (kein ffmpeg installiert, Ersatz-
+Skript s.u.) und mit PIL/numpy pixelgenau vermessen (Kopfmasse bestaetigt: 1.19:1,
+identisch zur ersten Messung — beide Videos zeigen dasselbe Produkt). Gefundene
+Luecken und Fixes:
+
+1. **Hintergrund viel zu blau/hell.** Die alte radiale Navy-Verlauf + ungefilterte
+   Vollbild-Weichzeichnung liess das halbe Bild blau leuchten; die Vorlage ist
+   fast reines Schwarz mit eng begrenztem Glanz. Fix: Hintergrund auf `#020810`
+   Kernton mit schnellem Abfall zu `#000000`; die beiden weiten Bloom-Stufen
+   bekommen vor dem Weichzeichnen `contrast()+brightness()` als billige
+   Schwellwert-Annaeherung (`THRESH_A`/`THRESH_B`), sodass nur echte Lichtspitzen
+   gluehen statt der ganzen Flaeche. Groesster Einzelgewinn in dieser Runde.
+2. **Goldenes Leiterbahn-Geflecht in der Aurora fehlte komplett.** Die Vorlage hat
+   neben den blauen Stromlinien ein dichtes Netz aus goldenen Zickzack-Pfaden mit
+   gluehenden Knoten (wirkt wie ein Schaltplan/Stadtlicht-Textur). Neu:
+   `circuits`-Array in `build()` (kurze Zickzack-Polylinien mit gelegentlicher
+   Abzweigung, 16-32 pro Seite) + `drawCircuits(t)` (Knoten an jeder Ecke, heller
+   Puls der den Pfad entlanglaeuft, gluehende Spitze).
+3. **Aurora zu flach/duenn.** Baender-Hoehe (`m`) und -Breite (`w`) angehoben,
+   Grundhelligkeit der Feldpartikel von `0.12+0.72*fbm` auf `0.22+0.95*fbm`.
+4. **Gesicht im Leerlauf zu dunkel.** Die Vorlage ruht nie im Dunkeln, nur leiser.
+   `lf`/`cf` in `updateHeatGrid` hatten bei `lvl≈0.05` (typischer Leerlauf-Pegel)
+   kaum Grundhelligkeit (`0.30+1.05*lvl`) -> auf `0.52+0.85*lvl` angehoben.
+5. **Konzentrische Radar-Ringe fehlten praktisch unsichtbar.** `drawRings` hatte
+   sie schon (Alpha 0.010-0.028 - de facto unsichtbar) aber ungenutzt lag auch
+   `S.ringPulse` brach. Neu: state-abhaengige "Pings" (`pings[]`) die beim
+   Zuhoeren alle ~0.95s entstehen, ueber 2.6s nach aussen wachsen und ausblenden
+   - genau das Radar-Verhalten aus der Vorlage im `STATUS: LISTENING`-Frame.
+6. **`thinking`-Zustand war nie im Demo-Zyklus.** `ORDER` und `demoDrive` liefen
+   nur idle->listening->speaking; die Vorlage hat 4 Zustaende (idle, listening,
+   thinking, speaking). `thinking` bekam eine eigene, langsame/unregelmaessige
+   Pegelkurve statt Sprach-Rhythmus.
+
+**Wichtige Falle bei den Browser-Tools in dieser Runde:** die Edit-Hooks oeffnen
+nach jedem Edit automatisch eine `file://`-Vorschau in einem NEUEN Tab, und
+gelegentlich stirbt `serve.py` zwischen Edits. Beides fuehrte zu "navigation
+denied"/leeren Screenshots, die wie ein Rendering-Bug aussahen, aber nur falsche
+Tab-Referenzen waren. Immer `tabId:"seed"` explizit angeben und bei Problemen
+zuerst `curl -sI http://localhost:8901` pruefen, bevor man am Code sucht.
+
+**Noch offen / naechste Ansatzpunkte** falls weiter verglichen wird: die
+Wellenlinien im Gesicht koennten in der Vorlage minimal hoeherfrequenter/schaerfer
+sein (schwer sicher zu sagen, das Referenzvideo ist H.264-komprimiert); Rand-
+Partikel-Staub am Scheitel ist in der Vorlage etwas dichter; die genaue Kurve der
+Aurora-Bergsilhouette wurde nach Augenmass, nicht pixelgenau nachgezogen.
+
 ## Leistung — was gebremst hat und was hilft
 Mit Kamera lief es zäh. Drei Ursachen, alle behoben:
 
