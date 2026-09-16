@@ -1,0 +1,1596 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>JARVIS</title>
+<!--
+  JARVIS — volumetrischer Partikel-Avatar
+  ==================================================================
+  Aufbau nach Vermessung der Vorlage (Vollbild-Frames, Pixelanalyse):
+
+    Kopf    3D-Punktwolke: 31 waagerechte Schnittringe durch ein
+            Schaedelvolumen, gleichmaessig ueber den Winkel abgetastet
+            und schwach-perspektivisch projiziert. Kopfhoehe:Breite =
+            1.23:1, der Kiefer laeuft NICHT spitz zu, sondern endet bei
+            0.62 Kopfbreite und geht dort in den Hals ueber.
+    Koerper Faecher aus Stromlinien: jede Linie haelt ihre relative
+            Position in der nach unten breiter werdenden Bueste, das
+            ergibt das Brunnen-Muster der Vorlage. Buendelung am
+            Brustbein, orange Adern laufen dort zusammen.
+    Felder  gerichtete Stromlinien-Baender mit hellem Grat + Funken.
+
+  Kopftracking (Taste T): MediaPipe Face Landmarker liest ueber die
+  Webcam die Kopfpose und legt Yaw/Pitch/Roll auf den Avatar. Der Roll
+  dreht um den Halsansatz, damit der Kopf am Koerper haengen bleibt;
+  die Gesichtsglut wandert mit der Kopfvorderseite mit. Standard ist
+  Spiegelverhalten (Taste K schaltet auf "Gegenueber" um).
+  Braucht http(s) - Modell und WASM kommen beim ersten Mal aus dem Netz.
+
+  Steuerung:  SPACE/Klick = Zustand · M = Mikrofon · T = Tracking
+              K = Trackingrichtung · H = UI aus
+  API:        JARVIS.setState('idle'|'listening'|'speaking'|'thinking')
+              JARVIS.setLevel(0..1) · JARVIS.say('...') · JARVIS.pulse()
+              JARVIS.startTracking() / .stopTracking() / .tracking
+              JARVIS.setPose(yaw,pitch,roll,shift)  // eigener Tracker
+              JARVIS.setHands(list,faceBox) · JARVIS.setFace({jaw,smile,...})
+-->
+<style>
+  :root { color-scheme: dark; }
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { height:100%; margin:0; background:#00030a; overflow:hidden; }
+  body { font-family: ui-monospace,"SF Mono",Menlo,Consolas,monospace; -webkit-font-smoothing:antialiased; cursor:pointer; }
+  #stage { position:fixed; inset:0; display:block; }
+  #vig { position:fixed; inset:0; pointer-events:none;
+    background:radial-gradient(135% 105% at 50% 46%, rgba(0,0,0,0) 46%, rgba(0,2,8,.34) 82%, rgba(0,1,5,.82) 100%); }
+  #scan { position:fixed; inset:0; pointer-events:none; opacity:.10;
+    background:repeating-linear-gradient(0deg, rgba(120,200,255,.05) 0 1px, rgba(0,0,0,0) 1px 3px); }
+  .ui { position:fixed; pointer-events:none; transition:opacity .45s ease; z-index:3; }
+  body.hide-ui .ui { opacity:0 !important; }
+
+  #brand { top:calc(20px + env(safe-area-inset-top)); left:24px; font-size:11px; letter-spacing:.46em;
+    color:#3fa9dc; text-shadow:0 0 18px rgba(30,150,235,.6); }
+  #brand small { display:block; font-size:8px; letter-spacing:.3em; color:#14567f; margin-top:7px; }
+
+  #status { top:calc(20px + env(safe-area-inset-top)); right:24px; text-align:right;
+    font-size:11px; letter-spacing:.34em; text-transform:uppercase; line-height:2; }
+  #status .k { color:#2280bd; }
+  #status .v { color:#7ef0ff; text-shadow:0 0 14px rgba(40,210,255,.9), 0 0 40px rgba(20,150,255,.55); }
+  #status .row2 { font-size:8.5px; letter-spacing:.3em; color:#175f92; }
+
+  #meter { left:24px; bottom:26px; width:118px; }
+  #meter .lbl { font-size:8px; letter-spacing:.3em; color:#175f92; margin-bottom:8px; }
+  #meter .bars { display:flex; gap:2px; align-items:flex-end; height:22px; }
+  #meter i { flex:1; border-radius:1px; background:#0a3a5e; }
+
+  #hint { right:24px; bottom:28px; font-size:8px; letter-spacing:.24em; color:#124b75; text-align:right; line-height:2; }
+
+  #caption { left:0; right:0; bottom:11%; text-align:center; padding:0 7vw;
+    font-family:-apple-system,"SF Pro Display","Helvetica Neue",Inter,system-ui,sans-serif;
+    font-weight:700; font-size:clamp(19px,2.7vw,38px); color:#fff;
+    text-shadow:0 2px 30px rgba(0,0,0,.92), 0 0 70px rgba(0,0,0,.75); }
+  #caption span { opacity:0; transition:opacity .2s ease; }
+  #caption span.on { opacity:1; }
+  #caption span.dim { opacity:.34; }
+
+  #cam {
+    position:fixed; right:24px; top:120px; width:168px; z-index:4;
+    display:none; opacity:0; transition:opacity .5s ease; pointer-events:none;
+  }
+  #cam.on { display:block; opacity:1; }
+  body.hide-ui #cam { opacity:0; }
+  #camVid {
+    width:100%; display:block; border-radius:3px;
+    transform:scaleX(-1);                      /* Spiegelbild wie im Badezimmer */
+    filter:grayscale(1) brightness(.75) contrast(1.15);
+    box-shadow:0 0 0 1px rgba(60,170,230,.35), 0 0 26px rgba(20,130,220,.28);
+  }
+  #camPose {
+    margin-top:6px; font-size:8px; letter-spacing:.18em; color:#2e86bd;
+    display:flex; justify-content:space-between; font-variant-numeric:tabular-nums;
+  }
+  @media (max-width:820px){
+    #cam { width:110px; right:14px; top:96px; }
+    #brand small,#hint,#meter { display:none; }
+    #brand,#status { font-size:9.5px; letter-spacing:.3em; }
+    #caption { bottom:17%; }
+  }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="scan"></div>
+<div id="vig"></div>
+<div class="ui" id="brand">J A R V I S<small>NEURAL INTERFACE v2</small></div>
+<div class="ui" id="status">
+  <div><span class="k">STATUS:</span> <span class="v" id="stateTxt">IDLE</span></div>
+  <div class="row2"><span id="subTxt">STANDBY</span></div>
+  <div class="row2"><span class="k">TRACKING:</span> <span id="trkTxt">AUS</span></div>
+</div>
+<div id="cam"><video id="camVid" playsinline muted></video><div id="camPose"></div></div>
+<div class="ui" id="meter"><div class="lbl">INPUT</div><div class="bars" id="bars"></div></div>
+<div class="ui" id="hint">SPACE · ZUSTAND<br>M · MIKROFON<br>T · KAMERA (KOPF·MIMIK·HAENDE)<br>K · RICHTUNG<br>H · UI</div>
+<div class="ui" id="caption"></div>
+<img id="refimg" alt="" style="position:fixed;pointer-events:none;z-index:9;display:none;opacity:.5;mix-blend-mode:screen">
+
+<script>
+(() => {
+'use strict';
+
+/* ==========================================================
+   0 · CANVAS + HILFSFUNKTIONEN
+   ========================================================== */
+const cv=document.getElementById('stage');
+const ctx=cv.getContext('2d',{alpha:false});
+const scene=document.createElement('canvas'), sctx=scene.getContext('2d');
+const glow=document.createElement('canvas'),  gctx=glow.getContext('2d');
+let W=0,H=0,DPR=1,U=1,GW=0,GH=0;
+const GS=4;
+let QUALITY=1;
+
+const rnd=(a,b)=>a+Math.random()*(b-a);
+const clamp=(v,a,b)=>v<a?a:(v>b?b:v);
+const lerp=(a,b,t)=>a+(b-a)*t;
+const smoothstep=(e0,e1,x)=>{const t=clamp((x-e0)/(e1-e0),0,1);return t*t*(3-2*t);};
+function hash(x,y){
+  let n=(x|0)*374761393+(y|0)*668265263;
+  n=(n^(n>>>13))*1274126177;
+  return ((n^(n>>>16))>>>0)/4294967296;
+}
+function noise2(x,y){
+  const xi=Math.floor(x),yi=Math.floor(y),xf=x-xi,yf=y-yi;
+  const u=xf*xf*(3-2*xf),v=yf*yf*(3-2*yf);
+  return lerp(lerp(hash(xi,yi),hash(xi+1,yi),u),lerp(hash(xi,yi+1),hash(xi+1,yi+1),u),v);
+}
+const fbm=(x,y)=>noise2(x,y)*0.55+noise2(x*2.13,y*2.07)*0.27+noise2(x*4.31,y*4.19)*0.13;
+const SINN=8192, SINT=new Float32Array(SINN+1);
+for(let i=0;i<=SINN;i++) SINT[i]=Math.sin(i/SINN*6.283185307179586);
+const INV_TAU=SINN/6.283185307179586;
+function fsin(x){ let i=(x*INV_TAU)|0; i%=SINN; if(i<0)i+=SINN; return SINT[i]; }
+
+function resize(){
+  DPR=Math.min(window.devicePixelRatio||1,2);
+  W=Math.max(2,Math.floor(innerWidth*DPR));
+  H=Math.max(2,Math.floor(innerHeight*DPR));
+  cv.width=scene.width=W; cv.height=scene.height=H;
+  cv.style.width=innerWidth+'px'; cv.style.height=innerHeight+'px';
+  GW=Math.max(2,(W/GS)|0); GH=Math.max(2,(H/GS)|0);
+  glow.width=GW; glow.height=GH;
+  U=DPR;
+  build();
+}
+addEventListener('resize',resize);
+
+/* ==========================================================
+   1 · FARBEN  (aus der Vorlage gemessen: Rim #05CDFC / #7DF6FD,
+       Ringe #315F87, Glut #DFA801 -> #E1EC74 -> #F1EFF6)
+   ========================================================== */
+const LEVELS=30, MIX=7;
+function ramp(st,v){
+  v=clamp(v,0,1);
+  for(let i=0;i<st.length-1;i++){
+    const a=st[i],b=st[i+1];
+    if(v<=b[0]){const t=(v-a[0])/Math.max(1e-6,b[0]-a[0]);
+      return [lerp(a[1],b[1],t),lerp(a[2],b[2],t),lerp(a[3],b[3],t),lerp(a[4],b[4],t)];}
+  }
+  const l=st[st.length-1];return[l[1],l[2],l[3],l[4]];
+}
+const COOL=[[0.00,  4, 26, 78,0.13],[0.16,  8, 62,150,0.30],[0.34, 14,108,206,0.50],
+            [0.54, 16,160,242,0.70],[0.72,  8,205,252,0.86],[0.88,125,246,253,0.95],[1.00,232,253,255,1.00]];
+const HEAT=[[0.00,126, 24,  2,0.34],[0.16,198, 54,  2,0.56],[0.34,236,110,  4,0.76],
+            [0.52,223,168,  1,0.88],[0.72,225,236,116,0.96],[0.88,244,246,190,0.99],[1.00,241,239,246,1.00]];
+const CSS=new Array(LEVELS*MIX);
+for(let m=0;m<MIX;m++){
+  const f=m/(MIX-1);
+  for(let i=0;i<LEVELS;i++){
+    const v=i/(LEVELS-1);
+    const a=ramp(COOL,v), b=ramp(HEAT,v);
+    CSS[m*LEVELS+i]='rgba('+(lerp(a[0],b[0],f)|0)+','+(lerp(a[1],b[1],f)|0)+','+
+                    (lerp(a[2],b[2],f)|0)+','+lerp(a[3],b[3],f).toFixed(3)+')';
+  }
+}
+/* Bucket-Puffer haelt Rechtecke (x,y,w,h): benachbarte Ringpunkte
+   gleicher Farbstufe werden zu einem Linienstueck zusammengefasst. */
+const BUCKETS=LEVELS*MIX, bufs=[], bufN=new Int32Array(BUCKETS);
+for(let i=0;i<BUCKETS;i++) bufs.push(new Float32Array(4*9000));
+function bucketOf(v,h){
+  const m=(smoothstep(0.010,0.16,h)*(MIX-1)+0.5)|0;
+  const lv=(h>0.012)? clamp(0.22*v+0.90*h,0,1) : clamp(v,0,1);
+  return m*LEVELS+Math.min(LEVELS-1,(lv*(LEVELS-1))|0);
+}
+let TARGET=null;                    // aktuelle Zeichenflaeche fuer den Ueberlauf-Flush
+function push(idx,x,y,w,h){
+  if(x<-8||y<-8||x>W+8||y>H+8) return;
+  const b=bufs[idx];
+  let n=bufN[idx];
+  if(4*n+3>=b.length){           // Puffer voll -> sofort ausgeben, statt Punkte zu verlieren
+    if(!TARGET) return;
+    flush(TARGET); n=0;
+  }
+  b[4*n]=x;b[4*n+1]=y;b[4*n+2]=w;b[4*n+3]=h;bufN[idx]=n+1;
+}
+function splat(x,y,v,h,s){ push(bucketOf(v,h),x,y,s,s); }
+function flush(c){
+  for(let i=0;i<BUCKETS;i++){
+    const n=bufN[i]; if(!n) continue;
+    c.fillStyle=CSS[i];
+    const b=bufs[i];
+    for(let k=0;k<n;k++) c.fillRect(b[4*k],b[4*k+1],b[4*k+2],b[4*k+3]);
+    bufN[i]=0;
+  }
+}
+
+/* ==========================================================
+   2 · ANATOMIE  (Profile aus der Vorlage gemessen)
+   t = 0 Scheitel … 1 Kieferbasis
+   ========================================================== */
+const WPROF=[
+ [0.000,0.000],[0.015,0.150],[0.040,0.300],[0.070,0.425],[0.120,0.570],[0.175,0.700],
+ [0.230,0.820],[0.290,0.865],[0.360,0.890],[0.430,0.912],[0.500,0.938],[0.560,0.962],
+ [0.596,1.000],[0.650,0.990],[0.700,0.966],[0.750,0.934],[0.800,0.892],[0.850,0.818],
+ [0.890,0.706],[0.925,0.622],[0.955,0.560],[0.978,0.480],[1.000,0.400]];
+const DPROF=[
+ [0.000,0.060],[0.060,0.520],[0.130,0.760],[0.220,0.960],[0.320,1.090],[0.420,1.160],
+ [0.520,1.200],[0.620,1.185],[0.700,1.130],[0.780,1.040],[0.850,0.930],[0.920,0.830],
+ [1.000,0.720]];
+function curve(tab,t){
+  t=clamp(t,0,1);
+  for(let i=0;i<tab.length-1;i++){
+    const a=tab[i],b=tab[i+1];
+    if(t<=b[0]){const u=(t-a[0])/(b[0]-a[0]);return lerp(a[1],b[1],u*u*(3-2*u));}
+  }
+  return tab[tab.length-1][1];
+}
+const headHalfW=t=>curve(WPROF,t);
+const headHalfD=t=>curve(DPROF,t);
+const headZC  =t=>-0.16*curve(DPROF,t);
+function faceRelief(t,sx){
+  const s=Math.abs(sx);
+  let z=0;
+  z+=0.30*Math.exp(-Math.pow((t-0.680)/0.080,2))*Math.exp(-Math.pow(s/0.20,2));
+  z+=0.11*Math.exp(-Math.pow((t-0.545)/0.048,2))*Math.exp(-Math.pow(s/0.52,2));
+  z+=0.09*Math.exp(-Math.pow((t-0.905)/0.060,2))*Math.exp(-Math.pow(s/0.30,2));
+  z-=0.06*Math.exp(-Math.pow((t-0.615)/0.055,2))*Math.exp(-Math.pow((s-0.62)/0.22,2));
+  return z;
+}
+/* Bueste: halbe Breite in Kopfbreiten, dy ab Kieferbasis (gemessen) */
+function bustHalf(dy){ const d=dy<0?0:dy; return 0.27 + 1.00*d + 0.22*smoothstep(0.05,0.22,d); }
+
+const G={};
+let headRows=[], strands=[], ribs=[], dust=[], fields=[], rings=[], veins=[], sternum=[];
+
+function build(){
+  const cx=W*0.5;
+  const SH=Math.min(H, W*1.30);
+  const TOP=(H-SH)*0.42;
+  let HH=SH*0.560, HW=HH/1.19;
+  if(HW>W*0.46){ HW=W*0.46; HH=HW*1.19; }
+  const crownY=TOP+SH*0.112;
+  Object.assign(G,{
+    cx, SH, TOP, HW, HH, R:HW*0.5, crownY,
+    throatY: crownY+HH,
+    camY: crownY+HH*0.50,
+    persp: 0.300/(HW*0.5*1.25),
+    faceCX: cx,
+    faceCY: crownY+HH*0.672,
+    faceRX: HW*0.325,
+    faceRY: HH*0.270
+  });
+
+  /* ---------- Kopf: 31 Schnittringe ---------- */
+  headRows=[];
+  const ROWS=Math.round(clamp(46*QUALITY,34,58));
+  for(let i=0;i<ROWS;i++){
+    const t=i/(ROWS-1);
+    const a=headHalfW(t)*G.R, d=headHalfD(t)*G.R, zc=headZC(t)*G.R;
+    const n=Math.round(clamp(Math.PI*(a+d)/(1.9*U/QUALITY),16,1100));
+    const st=new Float32Array(n),ct=new Float32Array(n),rel=new Float32Array(n),bv=new Float32Array(n);
+    for(let k=0;k<n;k++){
+      const th=(k/n)*6.283185307;
+      const S1=Math.sin(th),C1=Math.cos(th);
+      const wob=1+0.013*(fbm(th*1.2+i*0.7,i*0.31)-0.5)*2;
+      st[k]=S1*wob; ct[k]=C1;
+      rel[k]=faceRelief(t,S1)*G.R*(C1>0?1:0.15);
+      bv[k]=0.24+0.30*fbm(th*1.1+t*5.0,t*2.0)+0.16*fbm(th*3.7+t*11.0,t*4.0);
+    }
+    const RIM=Math.round(clamp(a/(0.7*U),8,80)), SPREAD=0.62, rn=RIM*2;
+    const rx=new Float32Array(rn),rz=new Float32Array(rn),rv=new Float32Array(rn);
+    let m=0;
+    for(let side=-1;side<=1;side+=2){
+      for(let j=0;j<RIM;j++){
+        const f=(j/(RIM-1))*2-1, th=side*1.5707963+f*SPREAD;
+        const S1=Math.sin(th),C1=Math.cos(th);
+        rx[m]=a*S1;
+        rz[m]=zc+d*C1+faceRelief(t,S1)*G.R*(C1>0?1:0.15);
+        rv[m]=Math.pow(1-Math.abs(f),2.1)*(0.58+0.50*fbm(j*0.9+t*21.0,t*4.0))*(Math.random()<0.10?0.40:1);
+        m++;
+      }
+    }
+    const prof=0.66+0.34*smoothstep(0.34,0.03,t)+0.26*smoothstep(0.30,0.92,t);
+    headRows.push({t,y0:crownY+t*HH,a,d,zc,n,st,ct,rel,bv,prof,rn,rx,rz,rv,ph:Math.random()*6.283});
+  }
+
+  /* ---------- Koerper: Faecher aus Stromlinien ---------- */
+  strands=[];
+  const fanY=G.throatY-G.HH*0.10;
+  const bodyLen=(H-fanY)/G.HW+0.30;
+  const NS=Math.round(clamp(46*QUALITY,30,64));
+  const PTS=Math.round(clamp(bodyLen*G.HW/(1.3*U),60,420));
+  for(let side=-1;side<=1;side+=2){
+    for(let j=0;j<NS;j++){
+      const u=side*(1-Math.pow(1-(j+0.6)/NS,1.25));
+      const au=Math.abs(u);
+      const sd=Math.random()*97;
+      const px=new Float32Array(PTS), py=new Float32Array(PTS), pv=new Float32Array(PTS);
+      for(let k=0;k<PTS;k++){
+        const s=k/(PTS-1);
+        const dy=s*bodyLen;
+        const hw=bustHalf(dy)*G.HW;
+        const wob=(fbm(s*3.4+sd,sd*0.7)-0.5)*0.055*G.HW*(0.3+au);
+        const ramp=0.34+0.66*smoothstep(0.0,0.42,dy);
+        px[k]=cx+u*ramp*hw+wob;
+        py[k]=fanY+dy*G.HW+(fbm(s*2.0+sd*1.3,sd)-0.5)*0.012*G.HW;
+        const edge=Math.pow(au,6.0)*0.30;
+        const near=Math.exp(-dy*0.95);
+        const rim=au>0.90;                                   // Trapezius-Saum: durchgehend
+        const dash=rim? (0.62+0.38*fbm(s*12.0+sd,sd))
+                      : Math.pow(0.24+0.76*fbm(s*13.0+sd*3.0,sd),1.35);
+        const mid=0.34+0.66*smoothstep(0.35,0.99,au);
+        let v=((rim?0.42:0.17)+edge+0.30*near)*dash*mid*(1-smoothstep(1.55,2.60,dy));
+        if(au<0.09) v+=0.26*Math.exp(-Math.pow((dy-0.62)/0.26,2))*dash;
+        pv[k]=clamp(v,0,1);
+      }
+      strands.push({px,py,pv,n:PTS,au,sd,sp:rnd(0.6,1.5)});
+    }
+  }
+  ribs=[];
+  const NR=20;
+  for(let r=0;r<NR;r++){
+    const dy=0.06+Math.pow(r/(NR-1),1.35)*bodyLen*0.92;
+    const hw=bustHalf(dy)*G.HW;
+    const n=Math.round(clamp(hw*2/(3.0*U),20,420));
+    const px=new Float32Array(n),py=new Float32Array(n),pv=new Float32Array(n);
+    for(let k=0;k<n;k++){
+      const u=(k/(n-1))*2-1;
+      px[k]=cx+u*hw;
+      py[k]=fanY+dy*G.HW+(1-u*u)*hw*0.16;
+      pv[k]=clamp((0.02+0.10*fbm(u*6.0+r*3.1,r*1.7))*(1-smoothstep(0.45,1.30,dy)),0,1);
+    }
+    ribs.push({px,py,pv,n,dy});
+  }
+  sternum=[];
+  const SN=Math.round(clamp(260*QUALITY,120,420));
+  for(let i=0;i<SN;i++){
+    sternum.push({a:rnd(0,6.283), r:Math.pow(Math.random(),1.7),
+                  b:rnd(0.25,1), tw:Math.random()*6.283, tws:rnd(1.0,3.6)});
+  }
+
+  /* ---------- Staub ---------- */
+  dust=[];
+  const DN=Math.round(clamp(W*H/(2600*DPR)*QUALITY,2400,11000));
+  for(let i=0;i<DN;i++){
+    const th=rnd(-Math.PI*1.16,Math.PI*0.16), ph=rnd(-0.95,0.95);
+    dust.push({ct:Math.cos(th),st:Math.sin(th),sp2:Math.sin(ph),
+      rr:1.0+Math.pow(Math.random(),1.9)*0.95,
+      sp:rnd(0.08,0.45),tw:Math.random()*6.283,tws:rnd(0.8,3.4),
+      b:rnd(0.18,1.0),fy:Math.random()});
+  }
+
+  /* ---------- Seitenfelder ---------- */
+  fields=[];
+  const bands=[
+    {y:-0.50,m:0.42,w:0.38,cr:0.34},
+    {y:-0.05,m:0.30,w:0.46,cr:0.60},
+    {y: 0.38,m:0.16,w:0.46,cr:0.24},
+    {y: 0.78,m:0.06,w:0.40,cr:0.52}
+  ];
+  for(let side=-1;side<=1;side+=2){
+    for(let bi=0;bi<bands.length;bi++){
+      const B=bands[bi];
+      const x0=cx+side*G.HW*0.50;
+      const y0=G.throatY+B.y*G.HW;
+      const span=(side<0? x0+G.HW*0.25 : W-x0+G.HW*0.25);
+      const NSR=Math.round(clamp(15*QUALITY,9,20));
+      const PN=Math.round(clamp(span/(2.8*U)*QUALITY,100,340));
+      for(let j=0;j<NSR;j++){
+        const o=(j/(NSR-1))*2-1;
+        const sd=Math.random()*131;
+        const crest=Math.abs(o-(B.cr*2-1))<0.09;
+        const px=new Float32Array(PN),py=new Float32Array(PN),pv=new Float32Array(PN);
+        for(let k=0;k<PN;k++){
+          const s=k/(PN-1);
+          const x=x0+side*s*span;
+          const drift=B.m*Math.pow(s,1.25)*G.HW;
+          const width=B.w*G.HW*(0.45+0.85*Math.pow(s,0.6));
+          const undu=(fbm(s*2.2+sd,sd*0.5)-0.5)*G.HW*0.075
+                    +(fbm(s*6.0+sd*2.0,sd)-0.5)*G.HW*0.028;
+          px[k]=x;
+          py[k]=y0+drift+o*width+undu;
+          const near=smoothstep(0.0,0.10,s), far=1-smoothstep(0.80,1.0,s);
+          const dens=Math.pow(1-Math.abs(o),1.1);
+          let v=(0.12+0.72*fbm(s*14.0+sd*3.0,sd*1.7))*near*far*dens;
+          if(crest) v+=0.55*near*far*(0.45+0.55*fbm(s*9.0+sd,sd*2.2));
+          pv[k]=clamp(v,0,1);
+        }
+        const SC=3, so=new Float32Array(PN*SC), sv=new Float32Array(PN*SC);
+        for(let k=0;k<PN;k++){
+          for(let m=0;m<SC;m++){
+            const off=(Math.random()-0.5)*2;
+            so[k*SC+m]=off*Math.abs(off)*B.w*G.HW*0.85;
+            sv[k*SC+m]=pv[k]*(0.30+0.55*Math.random())*Math.pow(1-Math.abs(off),1.3);
+          }
+        }
+        fields.push({px,py,pv,n:PN,crest,sd,sp:rnd(0.25,0.9),SC,so,sv});
+      }
+    }
+  }
+
+  rings=[];
+  for(let i=0;i<8;i++) rings.push({r:0.34+i*0.115,w:rnd(0.5,1.2),a:rnd(0.010,0.028)});
+  buildBustLUT();
+}
+
+/* ==========================================================
+   3 · ZUSTAND / REGIE
+   ========================================================== */
+/* --- Atmung ---------------------------------------------------------
+   Eine Phase p laeuft 0..1 durch: einatmen, kurz halten, ausatmen, ruhen.
+   Alle Uebergaenge sind Kosinus-geglaettet, die Ableitung ist an den
+   Nahtstellen null - deshalb gibt es keine harten Knicke. */
+const BR={p:Math.random(),v:0,rate:0.195,lift:0,rise:0,expand:0,amp:1};
+function breathCurve(p){
+  if(p<0.36) return 0.5-0.5*Math.cos(Math.PI*(p/0.36));        // einatmen
+  if(p<0.45) return 1;                                          // halten
+  if(p<0.88) return 0.5+0.5*Math.cos(Math.PI*((p-0.45)/0.43));  // ausatmen
+  return 0;                                                     // ruhen
+}
+function updateBreath(dt,lvl){
+  const goal = S.state==='speaking' ? 0.285 : (S.state==='listening'? 0.235 : 0.190);
+  BR.rate=lerp(BR.rate,goal,1-Math.pow(0.30,dt));
+  BR.p=(BR.p+dt*BR.rate)%1;
+  const v=breathCurve(BR.p);
+  BR.v=lerp(BR.v,v,1-Math.pow(0.004,dt));   // zusaetzlich weichgezogen
+  /* Massstab an der Kopfhoehe, nicht an Pixeln - sonst verschwindet
+     die Atmung auf grossen Bildschirmen. */
+  BR.rise  =BR.v*G.HH*0.0125*BR.amp;        // Brustkorb hebt sich
+  BR.expand=BR.v*0.019*BR.amp;              // und wird minimal breiter
+  BR.lift  =BR.v*G.HH*0.0048*BR.amp;        // Kopf faehrt leicht mit
+}
+
+const S={state:'idle',level:0,levelS:0,t:0,ringPulse:0,mic:false,demo:true,nextDemo:0,pi:0,
+         yaw:0,yawT:0,yawGoal:0,pitch:0,pitchGoal:0,roll:0,rollGoal:0,
+         shift:0,shiftGoal:0,glitch:0,nextGlitch:3};
+const PHRASES=['Systeme sind online.','Ich hoere zu.','Alle Knoten synchronisiert.',
+               'Neuronales Interface bereit.','Was kann ich fuer dich tun, Domi?'];
+const SUB={idle:'STANDBY',listening:'AUDIO IN · AKTIV',speaking:'SYNTHESE · AKTIV',thinking:'VERARBEITUNG'};
+const stateTxt=document.getElementById('stateTxt'),subTxt=document.getElementById('subTxt');
+const capEl=document.getElementById('caption'),barsEl=document.getElementById('bars');
+const BAR_N=20,barEls=[];
+for(let i=0;i<BAR_N;i++){const b=document.createElement('i');barsEl.appendChild(b);barEls.push(b);}
+let capWords=[],capIdx=0,capNext=0;
+function clearCaption(){capEl.textContent='';capWords=[];capIdx=0;}
+function applyState(s){S.state=s;stateTxt.textContent=s.toUpperCase();subTxt.textContent=SUB[s];S.ringPulse=1;}
+function setState(s){ if(!SUB[s])return; if(s!=='speaking')clearCaption(); applyState(s); }
+function say(text){
+  clearCaption();
+  const ws=String(text).split(/\s+/).filter(Boolean);
+  ws.forEach((w,i)=>{const sp=document.createElement('span');
+    sp.textContent=w+(i<ws.length-1?' ':'');capEl.appendChild(sp);capWords.push(sp);});
+  capNext=performance.now(); applyState('speaking');
+}
+function tickCaption(now){
+  if(capIdx<capWords.length&&now>=capNext){
+    if(capIdx>0)capWords[capIdx-1].classList.add('dim');
+    capWords[capIdx].classList.add('on');capIdx++;capNext=now+210+Math.random()*160;
+  }
+}
+function demoDrive(now){
+  if(!S.demo)return;
+  if(now>S.nextDemo){
+    if(S.state==='speaking'){setState('listening');S.nextDemo=now+2400;}
+    else if(S.state==='listening'){setState('idle');S.nextDemo=now+1700;}
+    else {say(PHRASES[S.pi++%PHRASES.length]);S.nextDemo=now+4400+Math.random()*1600;}
+  }
+  const t=S.t;
+  if(S.state==='speaking'){
+    const env=Math.abs(fsin(t*3.05+0.8))*0.6+0.4*Math.abs(fsin(t*7.4));
+    const syl=Math.max(0,fsin(t*13.1))*(0.5+0.5*fsin(t*2.2));
+    S.level=clamp(0.28+0.50*env+0.30*syl,0,1);
+  } else if(S.state==='listening'){
+    S.level=0.14+0.085*fsin(t*2.0)+0.04*fsin(t*5.1);
+  } else {
+    S.level=0.04+0.028*fsin(t*1.2);
+  }
+}
+let analyser=null,freqData=null;
+async function toggleMic(){
+  if(S.mic){S.mic=false;S.demo=true;subTxt.textContent=SUB[S.state];return;}
+  try{
+    const st=await navigator.mediaDevices.getUserMedia({audio:true});
+    const ac=new (window.AudioContext||window.webkitAudioContext)();
+    const src=ac.createMediaStreamSource(st);
+    analyser=ac.createAnalyser();analyser.fftSize=512;analyser.smoothingTimeConstant=0.70;
+    src.connect(analyser);freqData=new Uint8Array(analyser.frequencyBinCount);
+    S.mic=true;S.demo=false;clearCaption();setState('listening');
+  }catch(e){subTxt.textContent='MIKROFON BLOCKIERT';}
+}
+function micDrive(){
+  if(!S.mic||!analyser)return;
+  analyser.getByteFrequencyData(freqData);
+  let sum=0;const N=Math.min(90,freqData.length);
+  for(let i=2;i<N;i++)sum+=freqData[i];
+  S.level=Math.pow(clamp((sum/(N-2))/120,0,1),0.75);
+  const sp=S.level>0.19;
+  if(sp&&S.state!=='speaking')applyState('speaking');
+  if(!sp&&S.state==='speaking')setState('listening');
+}
+
+/* ==========================================================
+   4 · POSE + PROJEKTION
+   ========================================================== */
+let cyaw=1,syaw=0,croll=1,sroll=0,cpit=1,spit=0;
+function updatePose(dt){
+  const live = (TRACK.on||TRACK.ext) && TRACK.hasFace;
+  if(live){
+    // Kamera fuehrt: Zielwerte kommen aus dem Kopftracking
+    S.yawGoal=TRACK.yaw; S.pitchGoal=TRACK.pitch; S.rollGoal=TRACK.roll;
+    S.shiftGoal=TRACK.shift;
+  }else{
+    S.yawT-=dt;
+    if(S.yawT<=0){
+      S.yawGoal=rnd(-0.15,0.15)*(S.state==='idle'?1:0.6);
+      S.pitchGoal=rnd(-0.055,0.045);
+      S.yawT=rnd(2.2,5.0);
+    }
+    S.rollGoal=0; S.shiftGoal=0;
+  }
+  // beim Tracking schneller nachziehen, im Leerlauf traege
+  const k=1-Math.pow(live?0.0006:0.22, dt);
+  const f=live?1:0.55;
+  S.yaw  =lerp(S.yaw,  S.yawGoal,  k*f);
+  S.pitch=lerp(S.pitch,S.pitchGoal,k*f);
+  S.roll =lerp(S.roll, S.rollGoal, k*f);
+  S.shift=lerp(S.shift,S.shiftGoal,k*f);
+  cyaw=Math.cos(S.yaw); syaw=Math.sin(S.yaw);
+  croll=Math.cos(S.roll); sroll=Math.sin(S.roll);
+  cpit=Math.cos(S.pitch); spit=Math.sin(S.pitch);
+  if(S.t>S.nextGlitch){ S.glitch=1; S.nextGlitch=S.t+rnd(4,11); }
+  S.glitch=Math.max(0,S.glitch-dt*2.2);
+}
+const OUT=[0,0,0,0];
+function project(xl,zl,y0){
+  const bob=fsin(S.t*0.62)*1.05*U+fsin(S.t*0.29)*0.75*U-BR.lift;
+  /* Kopfdrehung um den Halsansatz: erst Gieren um die Hochachse,
+     dann Nicken um die Querachse. Danach schwache Perspektive. */
+  const yl=(y0+bob)-G.throatY;
+  const x1= xl*cyaw+zl*syaw;
+  const z1=-xl*syaw+zl*cyaw;
+  const y2= yl*cpit-z1*spit;
+  const z2= yl*spit+z1*cpit;
+  const s=1/(1-z2*G.persp);
+  const z=z1*cpit;                      // Flaechennormale fuer die Schattierung
+  let px=G.cx+x1*s+fsin(S.t*0.41)*1.8*U+S.shift*G.HW;
+  let py=G.camY+((G.throatY+y2)-G.camY)*s;
+  if(sroll!==0){                       // Kopfneigung: Drehung um den Halsansatz,
+    const dx=px-G.cx, dy=py-G.throatY; // damit der Kopf am Koerper haengen bleibt
+    px=G.cx+dx*croll-dy*sroll;
+    py=G.throatY+dx*sroll+dy*croll;
+  }
+  OUT[0]=px; OUT[1]=py; OUT[2]=z;
+  return OUT;
+}
+
+/* ==========================================================
+   4b · MIMIK
+   ----------------------------------------------------------
+   FT = Zielwerte (aus MediaPipe-Blendshapes bzw. aus dem
+   Mikrofonpegel), FACE = geglaettete Werte fuer das Bild.
+   Seiten sind BILDSCHIRM-Seiten, nicht Personen-Seiten - die
+   Umrechnung passiert im Tracker, abhaengig vom Spiegelmodus.
+   ========================================================== */
+const FKEYS=['jaw','smile','pucker','funnel','blinkL','blinkR','browL','browR',
+             'browIn','squint','wide','mX','mY','live'];
+const FACE={}, FT={};
+for(const k of FKEYS){ FACE[k]=0; FT[k]=0; }
+let blinkT=1.5, blinkV=0;
+function autoBlink(dt){
+  blinkT-=dt;
+  if(blinkT<=0){ blinkV=1; blinkT=rnd(2.2,6.5); }
+  blinkV=Math.max(0,blinkV-dt*7.5);
+  return blinkV>0.5 ? 1 : blinkV*2;
+}
+function updateFace(dt,lvl){
+  const live=(TRACK.on||TRACK.ext)&&TRACK.hasFace&&TRACK.blend;
+  FT.live=live?1:0;
+  if(!live){
+    /* Ohne Kamera: der Mund folgt dem Sprachpegel, der Rest ruht. */
+    FT.jaw = S.state==='speaking' ? clamp(Math.pow(lvl,0.8)*1.25,0,0.80) : 0;
+    FT.smile=0; FT.pucker=0; FT.funnel=0;
+    FT.blinkL=FT.blinkR=autoBlink(dt);
+    FT.browL=FT.browR=FT.browIn=FT.squint=FT.wide=FT.mX=FT.mY=0;
+  }
+  const kF=1-Math.pow(3e-7,dt);    // Mund und Lider: schnell
+  const kS=1-Math.pow(5e-4,dt);    // Brauen und Lage: ruhig
+  for(const k of FKEYS){
+    const fast=(k==='jaw'||k==='blinkL'||k==='blinkR'||k==='funnel'||k==='pucker');
+    FACE[k]=lerp(FACE[k],FT[k],fast?kF:kS);
+  }
+}
+
+/* ==========================================================
+   5 · GLUT (grobes Gitter, bilinear abgetastet)
+   ========================================================== */
+const HG={gx:80,gy:96,x0:0,y0:0,cx:0,cy:0,sx:1,sy:1,data:new Float32Array(81*97)};
+function updateHeatGrid(t,lvl){
+  const rx=G.faceRX*2.15, ry=G.faceRY*2.35;
+  /* Mittelpunkt dort, wo die Gesichtsvorderseite landet - ohne Roll,
+     denn heatGrid() rechnet die Neigung beim Abtasten heraus. */
+  const fd=headHalfD(0.66)*G.R;
+  const fyl=G.faceCY-G.throatY;
+  const fx1=fd*syaw, fz1=fd*cyaw;
+  const fy2=fyl*cpit-fz1*spit, fz2=fyl*spit+fz1*cpit;
+  const fs=1/(1-fz2*G.persp);
+  const fcx=G.cx+fx1*fs+S.shift*G.HW;
+  const fcy=G.camY+((G.throatY+fy2)-G.camY)*fs;
+  HG.cx=fcx; HG.cy=fcy;
+  HG.x0=fcx-rx; HG.y0=fcy-ry;
+  HG.sx=(2*rx)/HG.gx; HG.sy=(2*ry)/HG.gy;
+  const iw=1/(G.HW*0.17), ih=1/(G.HH*0.105);
+  const iw2=1/(G.HW*0.042), ih2=1/(G.HH*0.030);
+  const lf=0.30+1.05*lvl, cf=0.16*(0.20+0.80*lvl);
+  const eyeY=HG.cy-G.faceRY*0.46, eyeX=G.faceRX*0.46;
+  const eR=1/Math.pow(G.faceRX*0.21,2);
+
+  /* ---- Mund: leuchtender Lippenring, dunkle Hoehle beim Oeffnen ---- */
+  const jaw=FACE.jaw, sml=FACE.smile, puc=FACE.pucker;
+  const jawDeep=smoothstep(0.05,0.50,jaw);
+  const mCX=fcx+FACE.mX*G.faceRX*0.26;
+  const mCY=fcy+G.faceRY*(0.350+FACE.mY*0.07+jaw*0.13);
+  const mRX=Math.max(G.faceRX*0.12,G.faceRX*(0.460+0.140*sml-0.200*puc));
+  const mRY=Math.max(G.faceRY*0.020,G.faceRY*(0.034+0.300*jaw+0.050*FACE.funnel));
+  const mIX=1/mRX, mIY=1/mRY, mBX=mRX*2.4, mBY=mRY*2.4;
+  const mGain=(0.55+0.45*lvl)*clamp(FACE.live*0.9+smoothstep(0.04,0.30,jaw),0,1);
+
+  /* ---- Lider: 1 = offen. Zugekniffene Augen loeschen die Hoehle ---- */
+  const lidL=1-0.94*FACE.blinkL, lidR=1-0.94*FACE.blinkR;
+  const eRyL=1/Math.pow(G.faceRY*0.16*(0.20+0.80*lidL),2);
+  const eRyR=1/Math.pow(G.faceRY*0.16*(0.20+0.80*lidR),2);
+
+  /* ---- Hand dicht am Gesicht: die Glut zieht sich zur Hand ---- */
+  let hA=0,hX=0,hY=0,hI=1;
+  for(let i=0;i<HANDS.length;i++){
+    const A=HANDS[i];
+    if(A.vis<0.06||!A.pts||A.face<0.03) continue;
+    const a=A.face*A.vis;
+    if(a<=hA) continue;
+    let x=A.cx, y=A.cy;
+    if(sroll!==0){ const ddx=x-G.cx, ddy=y-G.throatY;
+      x=G.cx+ddx*croll+ddy*sroll; y=G.throatY-ddx*sroll+ddy*croll; }
+    hA=a; hX=x; hY=y; hI=1/Math.pow(Math.max(10*U,A.palm*1.6),2);
+  }
+  hA*=0.50;
+
+  const D=HG.data;
+  for(let j=0;j<=HG.gy;j++){
+    const sy=HG.y0+j*HG.sy, dY=sy-HG.cy;
+    const taper=1-0.26*smoothstep(0.05,1.45,dY/G.faceRY);
+    const dyr=dY/(G.faceRY*(dY<0?0.70:1.14));
+    const dy2=dyr*dyr;
+    const n1y=dY*ih-t*1.05, n2y=dY*ih2+t*0.95;
+    const dYe=sy-eyeY, eyL=dYe*dYe*eRyL, eyR=dYe*dYe*eRyR;
+    const mdy=sy-mCY, inM=(mdy>-mBY&&mdy<mBY);
+    for(let i=0;i<=HG.gx;i++){
+      const sx=HG.x0+i*HG.sx, dX=sx-HG.cx;
+      const dxr=dX/(G.faceRX*taper);
+      const d=dxr*dxr+dy2;
+      let h=0;
+      if(d<5.0){
+        const a1=fbm(dX*iw+t*0.65,n1y);
+        const a2=fbm(dX*iw2-t*1.45,n2y);
+        h=Math.exp(-d*0.86)*(0.20+0.56*a1+0.76*a2)+Math.exp(-d*2.2)*cf*1.25*(0.20+0.80*a2);
+        h*=lf*1.36;
+        h*=smoothstep(4.6,2.2,d);
+        if(eyL<6||eyR<6){
+          const exl=dX+eyeX, exr=dX-eyeX;   // exl = Bildschirm links
+          const el=eyL<6?Math.exp(-(exl*exl*eR+eyL))*(0.26+0.74*lidL):0;
+          const er=eyR<6?Math.exp(-(exr*exr*eR+eyR))*(0.26+0.74*lidR):0;
+          h*=1-0.46*Math.min(1,el+er);
+        }
+        if(inM&&mGain>0.01){
+          const mdx=sx-mCX;
+          if(mdx>-mBX&&mdx<mBX){
+            const u=mdx*mIX, w=mdy*mIY;
+            const e2=u*u+w*w, e=Math.sqrt(e2);
+            const lip=Math.exp(-Math.pow((e-1)*1.75,2));           // weicher Halo
+            h=h*(1-0.80*jawDeep*Math.exp(-e2*1.7))                 // Mundhoehle
+              + lip*mGain*(0.12+0.16*jawDeep);
+          }
+        }
+        if(hA>0){
+          const hdx=sx-hX, hdy=sy-hY;
+          const qh=(hdx*hdx+hdy*hdy)*hI;
+          if(qh<7) h+=hA*Math.exp(-qh)*(0.55+0.45*lvl);
+        }
+        const nz=Math.abs(dX)/(G.faceRX*0.085);
+        if(nz<3&&dY>-G.faceRY*0.2&&dY<G.faceRY*0.9) h*=1-0.16*Math.exp(-nz*nz);
+        if(h>0.99)h=0.99; else if(h<0)h=0;
+      }
+      D[j*(HG.gx+1)+i]=h;
+    }
+  }
+}
+function heatGrid(x,y){
+  if(sroll!==0){                       // Punkt in den ungeneigten Kopfraum zurueckdrehen
+    const dx=x-G.cx, dy=y-G.throatY;
+    x=G.cx+dx*croll+dy*sroll;
+    y=G.throatY-dx*sroll+dy*croll;
+  }
+  const fx=(x-HG.x0)/HG.sx, fy=(y-HG.y0)/HG.sy;
+  if(fx<0||fy<0||fx>=HG.gx||fy>=HG.gy) return 0;
+  const i=fx|0,j=fy|0,u=fx-i,v=fy-j,w=HG.gx+1,o=j*w+i,D=HG.data;
+  const a=D[o]+(D[o+1]-D[o])*u, b=D[o+w]+(D[o+w+1]-D[o+w])*u;
+  return a+(b-a)*v;
+}
+const BUST=new Float32Array(257);
+function buildBustLUT(){
+  for(let i=0;i<=256;i++){
+    const y=(i/256)*H;
+    let hw=0;
+    if(y>=G.crownY&&y<=G.throatY) hw=headHalfW((y-G.crownY)/G.HH)*G.R*1.04+3*U;
+    else if(y>G.throatY) hw=bustHalf((y-G.throatY+G.HH*0.10)/G.HW)*G.HW+3*U;
+    BUST[i]=hw;
+  }
+}
+function insideBust(x,y){
+  if(y<G.crownY-4||y>H) return false;
+  const i=(y*256/H)|0;
+  const dx=x-G.cx;
+  return (dx<0?-dx:dx)<BUST[i<0?0:(i>256?256:i)];
+}
+
+/* ==========================================================
+   6 · ZEICHNEN
+   ========================================================== */
+/* Kopfringe. Benachbarte Punkte gleicher Farbstufe werden zu einem
+   Linienstueck verschmolzen -> durchgehende Hoehenlinien wie im Original. */
+function drawHead(t,lvl){
+  const waveBase=0.42*U, waveHot=1.8*U;
+  const kx1=0.030/U, kx2=0.011/U;
+  for(let i=0;i<headRows.length;i++){
+    const R=headRows[i];
+    const w1=t*2.6+R.t*2.4+R.ph*0.25, w2=-t*1.15+R.t*1.6;
+    const invD=1/(R.d+1e-3), prof=R.prof;
+    const gly=(S.glitch>0&&((i*7+3)%5===0))?S.glitch*fsin(t*40+i)*3*U:0;
+    const st=R.st,ct=R.ct,rel=R.rel,bv=R.bv;
+    let rb=-1,rx0=0,rx1=0,ry=0,rs=1;
+    for(let k=0;k<R.n;k++){
+      const C=ct[k];
+      project(R.a*st[k], R.zc+R.d*C+rel[k], R.y0);
+      const x=OUT[0];
+      let y=OUT[1];
+      const face=OUT[2]*invD;
+      const front=face>0?(face>1?1:face):0;
+      let h=front>0?heatGrid(x,y)*front:0;
+      y+=fsin(x*kx1+w1)*(waveBase+waveHot*h)+fsin(x*kx2+w2)*waveBase*1.1+gly;
+      if(front>0) h=heatGrid(x,y)*front;
+
+      let v=bv[k];
+      v*= front>0 ? (0.40+0.86*Math.sqrt(front)) : 0.065;
+      const af=face<0?-face:face, om=1-af, om3=om*om*om;
+      v+=om3*om3*0.85;
+      v*=prof;
+      if(v>1)v=1;
+      if(v<0.030&&h<0.05){ if(rb>=0){push(rb,rx0,ry,rx1-rx0+rs,rs);rb=-1;} continue; }
+      const sz=(v>0.94||h>0.86)?1.6*U:((v>0.66||h>0.44)?1.2*U:1.0*U);
+      const b=bucketOf(v,h);
+      if(b===rb&&sz===rs&&Math.abs(y-ry)<1.1*U&&x>=rx0-2.6*U&&x<=rx1+2.6*U){
+        if(x<rx0)rx0=x; else if(x>rx1)rx1=x;
+      }else{
+        if(rb>=0) push(rb,rx0,ry,rx1-rx0+rs,rs);
+        rb=b; rx0=rx1=x; ry=y; rs=sz;
+      }
+    }
+    if(rb>=0) push(rb,rx0,ry,rx1-rx0+rs,rs);
+
+    const rx=R.rx,rz=R.rz,rv=R.rv;
+    const gain=(0.92+0.34*lvl)*(0.90+0.155*fsin(R.t*3.1+1.2))*(1-0.45*smoothstep(0.88,1.0,R.t));
+    for(let j=0;j<R.rn;j++){
+      project(rx[j],rz[j],R.y0);
+      const x=OUT[0], y=OUT[1]+fsin(x*kx1+w1)*0.42*U;
+      let v=rv[j]*gain;
+      if(v>1)v=1;
+      if(v<0.06) continue;
+      splat(x,y,v,0, v>0.86?2.2*U:(v>0.55?1.6*U:1.1*U));
+    }
+  }
+}
+
+/* Punkt auf der Gesichtsoberflaeche: u = seitlich, dy = unterhalb der
+   Gesichtsmitte, beides in Pixeln. Liefert Bildkoordinaten in OUT und
+   gibt zurueck, wie stark die Stelle zur Kamera zeigt (0 = abgewandt). */
+function faceSurf(u,dy){
+  const y0=G.faceCY+dy;
+  const tt=clamp((y0-G.crownY)/G.HH,0,1);
+  const a=headHalfW(tt)*G.R, d=headHalfD(tt)*G.R, zc=headZC(tt)*G.R;
+  const q=clamp(u/Math.max(1e-3,a),-1,1);
+  project(u, zc+d*Math.sqrt(1-q*q)*0.99, y0);
+  return clamp(OUT[2]/Math.max(1e-3,d),0,1);
+}
+
+/* Mund: Ober- und Unterlippe als Partikelzuege auf der Gesichtsflaeche.
+   Ueber das Glut-Gitter allein ginge das nicht - die Hoehenlinien des
+   Kopfes sind rund 18 px auseinander, ein Mund faende darin keine Form. */
+function drawMouth(t,lvl){
+  const vis=clamp(FACE.live*0.88+smoothstep(0.03,0.20,FACE.jaw),0,1);
+  if(vis<0.02) return;
+  const mw=Math.max(G.faceRX*0.20,G.faceRX*(0.46+0.14*FACE.smile-0.20*FACE.pucker));
+  const open=G.faceRY*(0.30*FACE.jaw+0.05*FACE.funnel);
+  const dyC=G.faceRY*(0.350+FACE.mY*0.07)+open*0.18;
+  const dxC=FACE.mX*G.faceRX*0.22;
+  const hUp=mw*0.15, hLo=mw*0.17;
+  const N=54, gain=vis*(0.46+0.24*lvl);
+  for(let lip=0;lip<2;lip++){
+    for(let row=-1;row<=1;row++){
+      const ro=row*mw*0.055;
+      let px0=0,py0=0,has=false;
+      for(let i=0;i<=N;i++){
+        const sgn=(i/N)*2-1;
+        const w=Math.pow(Math.max(0,1-sgn*sgn),0.60);
+        let dy=dyC+ro;
+        if(lip===0) dy+=-hUp*w-open*0.30+hUp*0.34*Math.exp(-Math.pow(sgn/0.20,2));
+        else        dy+= hLo*w+open*0.70;
+        dy-=FACE.smile*mw*0.18*Math.pow(Math.abs(sgn),1.6);
+        const front=faceSurf(dxC+sgn*mw,dy);
+        const x=OUT[0], y=OUT[1];
+        if(front>0.05){
+          const v=gain*front*(0.42+0.58*w)*(row===0?1:0.62);
+          if(v>0.05){
+            const hh=clamp(0.40+0.32*vis,0,1);
+            splat(x,y,v>1?1:v,hh,v>0.66?1.7*U:1.2*U);
+            if(has&&Math.abs(x-px0)<6*U&&Math.abs(y-py0)<6*U)
+              splat((x+px0)*0.5,(y+py0)*0.5,v*0.8,hh,1.0*U);
+          }
+          px0=x; py0=y; has=true;
+        }else has=false;
+      }
+    }
+  }
+}
+
+/* Brauen: nur solange die Kamera wirklich ein Gesicht fuehrt. */
+function drawBrows(t,lvl){
+  const g=FACE.live;
+  if(g<0.04) return;
+  const eyeU=G.faceRX*0.52, bw=G.faceRX*0.32;
+  for(let k=0;k<2;k++){
+    const side=k?1:-1;
+    const up=(k?FACE.browR:FACE.browL);
+    const base=-G.faceRY*(0.615+0.085*FACE.browIn)-up*G.faceRY*0.16;
+    for(let row=-1;row<=1;row++){
+      for(let i=0;i<=26;i++){
+        const sgn=(i/26)*2-1;
+        const w=Math.pow(Math.max(0,1-sgn*sgn),0.45);
+        const dy=base-bw*0.30*w+row*G.faceRY*0.020
+                 +sgn*side*FACE.browIn*G.faceRY*0.09;   // Innenende hebt sich
+        const front=faceSurf(side*eyeU+sgn*bw,dy);
+        if(front<0.06) continue;
+        const v=g*front*(0.30+0.40*w)*(row===0?1:0.55);
+        if(v<0.05) continue;
+        splat(OUT[0],OUT[1],v>1?1:v,0.40,v>0.45?1.4*U:1.0*U);
+      }
+    }
+  }
+}
+
+/* Koerper: Stromlinien-Faecher + Querboegen + Brustbein-Buendel */
+function drawBody(t,lvl){
+  /* Atmung: der Brustkorb hebt sich und wird dabei minimal breiter.
+     Der untere Saum bleibt stehen, sonst rutscht der ganze Koerper. */
+  const rise=BR.rise, exp=BR.expand;
+  const idle=fsin(t*0.31)*0.85*U;
+  const lg=(0.74+0.50*lvl)*(1+0.05*BR.v);
+  for(let i=0;i<strands.length;i++){
+    const F=strands[i];
+    const px=F.px,py=F.py,pv=F.pv;
+    const sway=fsin(t*0.33*F.sp+F.sd)*1.8*U;
+    const flick=0.82+0.18*fsin(t*1.6*F.sp+F.sd*2.1);
+    for(let k=0;k<F.n;k++){
+      const v=pv[k]*flick*lg;
+      if(v<0.035) continue;
+      const s=k/F.n;
+      const bw=1-0.42*s;                       // Hub nimmt nach unten ab
+      const ew=smoothstep(0.02,0.38,s);        // Weite erst ab den Schultern
+      splat(G.cx+(px[k]-G.cx)*(1+exp*ew)+sway*s,
+            py[k]-rise*bw+idle*(1-s*0.5), v>1?1:v, 0,
+            v>0.86?1.9*U:(v>0.50?1.3*U:1.0*U));
+    }
+  }
+  for(let i=0;i<ribs.length;i++){
+    const Rb=ribs[i],px=Rb.px,py=Rb.py,pv=Rb.pv;
+    const s=clamp(Rb.dy/1.6,0,1);
+    const bw=1-0.42*s, ew=smoothstep(0.02,0.38,s);
+    const dy=-rise*bw+idle*0.4;
+    for(let k=0;k<Rb.n;k++){
+      const v=pv[k]*lg;
+      if(v<0.035) continue;
+      splat(G.cx+(px[k]-G.cx)*(1+exp*ew),py[k]+dy,v>1?1:v,0,v>0.7?1.3*U:1.0*U);
+    }
+  }
+  const sx=G.cx, sy=G.throatY+0.70*G.HW-rise*0.85, rad=G.HW*0.085;
+  const sg=1+0.28*BR.v;                        // Brustbein glueht beim Einatmen auf
+  for(let i=0;i<sternum.length;i++){
+    const d=sternum[i];
+    const rr=d.r*(1+0.10*fsin(t*1.3+d.tw));
+    const x=sx+Math.cos(d.a)*rad*rr*1.5;
+    const y=sy+Math.sin(d.a)*rad*rr*2.6;
+    let v=d.b*(0.45+0.55*fsin(t*d.tws+d.tw))*(1-rr)*lg*1.5*sg;
+    if(v<0.05) continue;
+    splat(x,y,v>1?1:v,0,v>0.7?1.8*U:1.2*U);
+  }
+}
+
+function drawFields(t){
+  for(let i=0;i<fields.length;i++){
+    const F=fields[i],px=F.px,py=F.py,pv=F.pv;
+    const drift=fsin(t*0.22*F.sp+F.sd)*G.HW*0.012;
+    const flick=0.80+0.20*fsin(t*0.9*F.sp+F.sd*1.7);
+    for(let k=0;k<F.n;k++){
+      const v=pv[k]*flick;
+      if(v<0.035) continue;
+      const x=px[k], y=py[k]+drift;
+      if(insideBust(x,y)) continue;
+      splat(x,y,v>1?1:v,0, v>0.90?1.9*U:(v>0.58?1.3*U:1.0*U));
+      const b0=k*F.SC;
+      for(let m=0;m<F.SC;m++){
+        const vv=F.sv[b0+m]*flick;
+        if(vv<0.04) continue;
+        const yy=y+F.so[b0+m];
+        if(insideBust(x,yy)) continue;
+        splat(x,yy,vv>1?1:vv,0, vv>0.85?1.7*U:1.0*U);
+      }
+      if(F.crest&&(k%71===0)){
+        const w=0.30+0.5*fsin(t*2.4+k*0.6+F.sd);
+        if(w>0.36) splat(x,y,0.55,w,1.6*U);
+      }
+    }
+  }
+}
+
+function drawDust(t,lvl){
+  const cyh=G.crownY+G.HH*0.45, lg=0.60+0.75*lvl;
+  for(let i=0;i<dust.length;i++){
+    const d=dust[i];
+    const rr=d.rr+0.05*fsin(t*d.sp+d.tw)+lvl*0.07;
+    const drift=((d.fy+t*0.018*d.sp)%1)*G.HH*0.20;
+    project(d.ct*G.R*1.02*rr, d.sp2*G.R*0.9*rr, cyh+d.st*G.HH*0.5*rr-drift*0.5);
+    const tw=0.40+0.60*fsin(t*d.tws+d.tw);
+    const f=1.86-rr;
+    if(f<=0) continue;
+    let v=d.b*tw*Math.pow(f>1?1:f,1.25)*lg;
+    if(v>1)v=1;
+    if(v<0.05) continue;
+    splat(OUT[0],OUT[1],v,0,v>0.85?2.0*U:(v>0.50?1.4*U:1.0*U));
+  }
+}
+
+/* Orange Adern: verzweigter Baum von der Kehle zum Brustbein */
+let veinT=0;
+function rebuildVeins(){
+  veins=[];
+  const topY=G.throatY+G.HW*0.045, botY=G.throatY+G.HW*0.70;
+  for(let i=0;i<4;i++){
+    const x0=G.cx+(i-1.5)*G.HW*0.075+rnd(-2,2)*U;
+    const segs=12, pts=[[x0,topY]];
+    for(let k=1;k<=segs;k++){
+      const q=k/segs, conv=Math.pow(q,1.6);
+      pts.push([ lerp(x0,G.cx,conv)+fsin(q*7.0+i*2.2)*G.HW*0.022*(1-conv)+rnd(-1.4,1.4)*U,
+                 lerp(topY,botY,q) ]);
+    }
+    const branch=[];
+    if(Math.random()<0.75){
+      const s=3+((Math.random()*5)|0), bp=pts[s], bl=[bp], sg=Math.random()<0.5?-1:1;
+      for(let k=1;k<=4;k++) bl.push([bp[0]+sg*k*rnd(2,6)*U, bp[1]+k*rnd(5,11)*U]);
+      branch.push(bl);
+    }
+    veins.push({pts,branch,a:rnd(0.5,1)});
+  }
+  veins.push({pts:[[G.cx,G.throatY+G.HW*0.42],[G.cx+rnd(-1,1)*U,botY+G.HW*0.06]],branch:[],a:1});
+}
+function drawVeins(c,t,lvl){
+  if(t>veinT){ rebuildVeins(); veinT=t+0.10+Math.random()*0.14; }
+  c.save(); c.translate(0,-BR.rise*0.80);
+  const amp=(0.28+0.72*lvl)*(1+0.22*BR.v);
+  for(const b of veins){
+    const line=pp=>{
+      c.beginPath(); c.moveTo(pp[0][0],pp[0][1]);
+      for(let i=1;i<pp.length;i++) c.lineTo(pp[i][0],pp[i][1]);
+      c.lineWidth=3.2*U; c.strokeStyle='rgba(236,110,4,'+(0.13*amp*b.a).toFixed(3)+')'; c.stroke();
+      c.lineWidth=1.4*U; c.strokeStyle='rgba(223,168,1,'+(0.36*amp*b.a).toFixed(3)+')'; c.stroke();
+      c.lineWidth=0.7*U; c.strokeStyle='rgba(248,226,150,'+(0.58*amp*b.a).toFixed(3)+')'; c.stroke();
+    };
+    line(b.pts); for(const br of b.branch) line(br);
+  }
+  c.restore();
+}
+
+function drawRings(c,t,lvl){
+  const cx=G.cx, cyy=G.crownY+G.HH*0.5, base=Math.max(W,H)*0.62;
+  for(let i=0;i<rings.length;i++){
+    const R=rings[i], r=base*(R.r+0.012*fsin(t*0.4+i));
+    c.beginPath(); c.ellipse(cx,cyy,r,r*0.96,0,0,6.283);
+    c.lineWidth=R.w*U; c.strokeStyle='rgba(20,92,180,'+((R.a*(0.5+0.5*lvl)).toFixed(3))+')'; c.stroke();
+  }
+}
+
+/* ==========================================================
+   7 · LOOP
+   ========================================================== */
+let last=performance.now(), ftAvg=16, qCheck=0;
+function frame(now){
+  const dt=Math.min(0.05,(now-last)/1000); last=now; S.t+=dt;
+  demoDrive(now); micDrive(); tickCaption(now); updatePose(dt); updateHands(dt);
+  S.levelS=lerp(S.levelS,S.level,1-Math.pow(0.0018,dt));
+  updateBreath(dt,S.levelS); updateFace(dt,S.levelS);
+  S.ringPulse=Math.max(0,S.ringPulse-dt*0.7);
+  const lvl=S.levelS, t=S.t;
+  const t0=performance.now();
+
+  ctx.globalCompositeOperation='source-over';
+  const bg=ctx.createRadialGradient(G.cx,G.crownY+G.HH*0.55,0,G.cx,G.crownY+G.HH*0.9,Math.max(W,H)*0.85);
+  bg.addColorStop(0,'#06152f'); bg.addColorStop(0.42,'#020c1e'); bg.addColorStop(1,'#00040c');
+  ctx.fillStyle=bg; ctx.fillRect(0,0,W,H);
+  ctx.globalCompositeOperation='lighter';
+  drawRings(ctx,t,lvl);
+
+  updateHeatGrid(t,lvl);
+  sctx.globalCompositeOperation='source-over'; sctx.clearRect(0,0,W,H);
+  sctx.globalCompositeOperation='lighter';
+  TARGET=sctx;
+  drawFields(t);
+  drawBody(t,lvl);
+  drawHands(t,lvl);
+  drawHead(t,lvl);
+  drawBrows(t,lvl);
+  drawMouth(t,lvl);
+  drawDust(t,lvl);
+  flush(sctx); TARGET=null;
+  drawVeins(sctx,t,lvl);
+
+  gctx.globalCompositeOperation='source-over'; gctx.clearRect(0,0,GW,GH);
+  gctx.drawImage(scene,0,0,GW,GH);
+
+  ctx.globalCompositeOperation='lighter';
+  ctx.filter='blur(1.6px)'; ctx.globalAlpha=0.95+0.30*lvl; ctx.drawImage(glow,0,0,W,H);
+  ctx.filter='blur(5px)';   ctx.globalAlpha=0.72+0.40*lvl; ctx.drawImage(glow,0,0,W,H);
+  ctx.filter='blur(20px)'; ctx.globalAlpha=0.62+0.48*lvl; ctx.drawImage(glow,0,0,W,H);
+  ctx.filter='none'; ctx.globalAlpha=1; ctx.drawImage(scene,0,0);
+  ctx.globalCompositeOperation='source-over';
+
+  for(let i=0;i<BAR_N;i++){
+    const f=i/(BAR_N-1);
+    const v=clamp(lvl*(0.5+0.9*Math.abs(fsin(t*6.0+f*7.0)))*(1-0.3*f),0.02,1);
+    const el=barEls[i];
+    el.style.height=(12+v*88).toFixed(1)+'%';
+    el.style.background=v>0.55?'#7ef0ff':(v>0.25?'#1aa0e0':'#0a3a5e');
+    el.style.boxShadow=v>0.55?'0 0 9px rgba(90,225,255,.75)':'none';
+  }
+
+  ftAvg=lerp(ftAvg,performance.now()-t0,0.05);
+  if(now-qCheck>2500){
+    qCheck=now;
+    if(ftAvg>19&&QUALITY>0.5){ QUALITY=Math.max(0.5,QUALITY-0.18); build(); }
+    else if(ftAvg<8&&QUALITY<1.2){ QUALITY=Math.min(1.2,QUALITY+0.12); build(); }
+  }
+  requestAnimationFrame(frame);
+}
+
+/* ==========================================================
+   7b · HAENDE  (nur Haende, keine Arme)
+   ----------------------------------------------------------
+   Die Hand wird in Szenenkoordinaten gezeichnet, ihre Groesse
+   kommt aus der gemessenen Handflaechenlaenge - dadurch wird
+   sie automatisch groesser, wenn sie naeher an der Kamera ist.
+   Zusaetzlich schaetzt der Tracker eine Tiefe z (-1 fern .. +1 nah)
+   aus dem Verhaeltnis Handflaeche zu Gesichtsbreite. Die Tiefe
+   steuert Helligkeit, Strichstaerke und - wenn die Hand hinter
+   den Kopf geht - die Verdeckung.
+   ========================================================== */
+const HAND_BONES=[[0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],[5,9],[9,10],
+  [10,11],[11,12],[9,13],[13,14],[14,15],[15,16],[13,17],[17,18],[18,19],[19,20],[0,17]];
+const TIPS=[4,8,12,16,20];
+/* Knochen der Handflaeche (kraeftiger als die Finger) */
+const PALM_BONES=new Set([0*32+1,0*32+5,5*32+9,9*32+13,13*32+17,0*32+17]);
+const HANDS=[{side:-1,vis:0,pts:null,raw:null,pz:null,rawz:null,
+              z:0,zRaw:0,face:0,faceRaw:0,palm:1,cx:0,cy:0},
+             {side: 1,vis:0,pts:null,raw:null,pz:null,rawz:null,
+              z:0,zRaw:0,face:0,faceRaw:0,palm:1,cx:0,cy:0}];
+const ARMS=HANDS;                       // alter Name, damit nichts bricht
+/* Abbildung Kamerabild -> Szene, am erkannten Gesicht verankert */
+const MAP={ok:false,sc:1,fx:0.5,fy:0.4,asp:0.75,faceW:0.25,t:0};
+
+/* Der Abstand zum Gesicht wird weich begrenzt, damit die Haende im
+   Bild bleiben - bis dahin ist die Abbildung aber massstabsgetreu. */
+const soft=(v,L)=>L*Math.tanh(v/L);
+function mapX(x){
+  const d=(TRACK.mirror?-(x-MAP.fx):(x-MAP.fx))*MAP.sc;
+  return G.cx+soft(d,W*0.46);
+}
+function mapY(y){
+  const d=(y*MAP.asp-MAP.fy)*MAP.sc;
+  return G.faceCY+soft(d,H*0.42);
+}
+
+function updateHands(dt){
+  for(const A of HANDS){
+    const want=A.raw?1:0;
+    A.vis=lerp(A.vis,want,1-Math.pow(want?0.0015:0.02,dt));
+    if(A.vis<0.004){ A.vis=0; A.pts=null; A.face=0; continue; }
+    if(!A.raw) continue;
+    if(!A.pts){
+      A.pts=A.raw.map(q=>[q[0],q[1]]);
+      A.pz=A.rawz.slice(); A.z=A.zRaw; A.face=A.faceRaw;
+    }else{
+      const k=1-Math.pow(0.0005,dt);          // Landmarken glaetten
+      for(let i=0;i<21;i++){
+        A.pts[i][0]=lerp(A.pts[i][0],A.raw[i][0],k);
+        A.pts[i][1]=lerp(A.pts[i][1],A.raw[i][1],k);
+        A.pz[i]=lerp(A.pz[i],A.rawz[i],k);
+      }
+      const kz=1-Math.pow(0.004,dt);          // Tiefe traeger, sonst flackert sie
+      A.z=lerp(A.z,A.zRaw,kz);
+      A.face=lerp(A.face,A.faceRaw,kz);
+    }
+    A.palm=Math.hypot(A.pts[9][0]-A.pts[0][0],A.pts[9][1]-A.pts[0][1])||G.HW*0.18;
+    let sx=0,sy=0;
+    for(let i=0;i<21;i++){ sx+=A.pts[i][0]; sy+=A.pts[i][1]; }
+    A.cx=sx/21; A.cy=sy/21;
+  }
+}
+
+/* Knochen als sich verjuengendes Partikelrohr.
+   occl>0 dimmt den Teil, der hinter dem Kopf/Koerper liegt. */
+function drawBone(ax,ay,bx,by,r0,r1,gain,t,seed,heat,ring,occl){
+  const dx=bx-ax, dy=by-ay;
+  const len=Math.sqrt(dx*dx+dy*dy);
+  if(len<1.2) return;
+  const ux=dx/len, uy=dy/len, px=-uy, py=ux;
+  const N=Math.max(4,Math.round(len/(2.6*U)));
+  const M=9;
+  for(let i=0;i<=N;i++){
+    const s=i/N;
+    const cx0=ax+dx*s, cy0=ay+dy*s;
+    const r=lerp(r0,r1,s);
+    const oc=(occl>0&&insideBust(cx0,cy0))?(1-occl):1;
+    if(oc<0.02) continue;
+    for(let k=0;k<M;k++){
+      const off=(k/(M-1))*2-1;
+      const ao=Math.abs(off);
+      const x=cx0+px*off*r, y=cy0+py*off*r;
+      const rim=Math.pow(ao,6.0)*0.85;
+      const dash=0.30+0.70*fbm(s*16.0+seed+k*2.3,seed*1.7+k);
+      let v=(0.38+rim*1.15)*dash*gain*oc;
+      if(v<0.030) continue;
+      splat(x,y,v>1?1:v,heat*(0.3+0.7*ao),v>0.80?1.7*U:1.1*U);
+    }
+    if(ring&&i%6===0){
+      for(let k=0;k<9;k++){
+        const off=(k/8)*2-1;
+        const v=(0.05+0.09*fbm(i*3.1+seed,k))*gain*oc;
+        if(v<0.03) continue;
+        splat(cx0+px*off*r, cy0+py*off*r, v, 0, 1.0*U);
+      }
+    }
+  }
+}
+
+function drawHands(t,lvl){
+  for(const A of HANDS){
+    if(A.vis<0.02||!A.pts) continue;
+    const P=A.pts, pz=A.pz, pl=A.palm;
+    const z=A.z;                                  // -1 fern … +1 nah
+    const near=z*0.5+0.5;                         // 0..1
+    /* Nah = heller und kraeftiger, fern = duenn und matt. */
+    const g=A.vis*(0.86+0.30*lvl)*(0.62+0.62*near);
+    const heat=(0.03+0.14*lvl)+0.34*smoothstep(0.12,0.90,A.face);
+    /* Hinter dem Kopf wird die Hand verdeckt - das verkauft die Tiefe. */
+    const occl=clamp((-z-0.10)/0.45,0,1)*0.88;
+    /* Radien relativ zur Handflaechenlaenge - dadurch stimmt die
+       Strichstaerke automatisch, egal wie nah die Hand ist. */
+    const rPalm=pl*0.062, rFin=pl*0.040, rTip=pl*0.027;
+
+    for(const [a,b] of HAND_BONES){
+      /* Finger, die zur Kamera zeigen, werden dicker und heller. */
+      const w=clamp(1-(pz[a]+pz[b])*0.8,0.60,1.6);
+      const palmBone=PALM_BONES.has(a*32+b);
+      const r0=(palmBone?rPalm:rFin)*w;
+      const r1=(palmBone?rFin:rTip)*w;
+      drawBone(P[a][0],P[a][1],P[b][0],P[b][1], r0, r1,
+               g*(0.80+0.28*w), t, a*3.7+b, heat*0.34, palmBone, occl);
+    }
+    /* Handgelenkknoten */
+    if(occl<0.85){
+      for(let k=0;k<20;k++){
+        const an=k/20*6.283, rad=pl*0.062*(0.72+0.28*fsin(t*2.0+k));
+        const x=P[0][0]+Math.cos(an)*rad, y=P[0][1]+Math.sin(an)*rad*0.85;
+        const oc=insideBust(x,y)?(1-occl):1;
+        splat(x,y,0.42*g*oc,heat*0.4,1.2*U);
+      }
+    }
+    /* Fingerkuppen gluehen - naeher an der Kamera deutlich staerker */
+    for(const i of TIPS){
+      const x=P[i][0], y=P[i][1];
+      const oc=(insideBust(x,y))?(1-occl):1;
+      if(oc<0.05) continue;
+      const zf=clamp(1-pz[i]*1.8,0.6,2.0);
+      const rr=pl*0.046*zf;
+      for(let k=0;k<10;k++){
+        const an=k/10*6.283, rad=rr*(0.6+0.4*fsin(t*3.0+k+i));
+        splat(x+Math.cos(an)*rad,y+Math.sin(an)*rad,
+              clamp(0.68*g*zf*oc,0,1),0.45+0.55*Math.max(lvl,A.face),1.5*U);
+      }
+    }
+  }
+}
+
+/* ==========================================================
+   8 · KAMERA-KOPFTRACKING
+   ----------------------------------------------------------
+   MediaPipe Face Landmarker liefert eine 4x4-Kopfmatrix; daraus
+   werden Yaw/Pitch/Roll gezogen und auf die Pose des Avatars
+   gelegt. Laeuft nur ueber http(s) - im Artifact blockt die CSP
+   die Modell-Downloads.
+   ========================================================== */
+const TRACK={
+  on:false, ext:false, loading:false, hasFace:false, engine:null, handEngine:null, video:null,
+  yaw:0, pitch:0, roll:0, shift:0,
+  rawYaw:0, rawPitch:0, rawRoll:0,
+  lastSeen:0, lastTs:0, err:'', blend:false, hframe:0,
+  zRef:0.68, handScale:1.00,   // zRef kalibriert sich langsam selbst
+  mirror:true,                 // Bewegung wie im Spiegel (er dreht links -> Avatar dreht links)
+  gainYaw:1.05, gainPitch:0.85, gainRoll:0.55, gainShift:0.09,
+  maxYaw:0.62, maxPitch:0.38, maxRoll:0.30, maxShift:0.055
+};
+const trkTxt=document.getElementById('trkTxt');
+const camBox=document.getElementById('cam');
+const camVid=document.getElementById('camVid');
+const camPose=document.getElementById('camPose');
+const MP_VER='0.10.14';
+const MP_BASE='https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@'+MP_VER;
+const MP_MODEL='https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task';
+const MP_HAND='https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task';
+
+function trkStatus(txt,color){
+  trkTxt.textContent=txt;
+  trkTxt.style.color=color||'#175f92';
+}
+
+async function trackingOn(){
+  if(TRACK.on||TRACK.loading) return;
+  TRACK.loading=true; TRACK.err=''; trkStatus('KAMERA…','#2e86bd');
+  try{
+    const stream=await navigator.mediaDevices.getUserMedia({
+      video:{ width:{ideal:640}, height:{ideal:480}, facingMode:'user' }, audio:false
+    });
+    camVid.srcObject=stream; TRACK.video=camVid;
+    await camVid.play();
+    camBox.classList.add('on');
+
+    trkStatus('MODELL…','#2e86bd');
+    const vision=await import(MP_BASE+'/vision_bundle.mjs');
+    const fileset=await vision.FilesetResolver.forVisionTasks(MP_BASE+'/wasm');
+    TRACK.engine=await vision.FaceLandmarker.createFromOptions(fileset,{
+      baseOptions:{ modelAssetPath:MP_MODEL, delegate:'GPU' },
+      runningMode:'VIDEO', numFaces:1,
+      outputFacialTransformationMatrixes:true,
+      outputFaceBlendshapes:true
+    });
+    try{
+      TRACK.handEngine=await vision.HandLandmarker.createFromOptions(fileset,{
+        baseOptions:{ modelAssetPath:MP_HAND, delegate:'GPU' },
+        runningMode:'VIDEO', numHands:2
+      });
+    }catch(e){ console.warn('Handmodell nicht geladen:',e); TRACK.handEngine=null; }
+    TRACK.on=true; TRACK.loading=false;
+    try{ localStorage.setItem('jarvis.track','1'); }catch(e){}
+    trkStatus('SUCHE GESICHT','#2e86bd');
+    requestAnimationFrame(trackLoop);
+  }catch(e){
+    TRACK.loading=false;
+    TRACK.err=String(e&&e.message||e);
+    const denied=/denied|not allowed|permission/i.test(TRACK.err);
+    trkStatus(denied?'KAMERA ABGELEHNT':'NICHT VERFUEGBAR','#a8542e');
+    console.warn('Tracking:',TRACK.err);
+    trackingOff(true);
+  }
+}
+function trackingOff(keepMsg){
+  TRACK.on=false; TRACK.hasFace=false; TRACK.blend=false;
+  if(TRACK.engine&&TRACK.engine.close){ try{TRACK.engine.close();}catch(e){} }
+  if(TRACK.handEngine&&TRACK.handEngine.close){ try{TRACK.handEngine.close();}catch(e){} }
+  TRACK.engine=null; TRACK.handEngine=null;
+  HANDS[0].raw=HANDS[1].raw=null; HANDS[0].face=HANDS[1].face=0;
+  if(camVid.srcObject){ camVid.srcObject.getTracks().forEach(t=>t.stop()); camVid.srcObject=null; }
+  camBox.classList.remove('on');
+  try{ localStorage.removeItem('jarvis.track'); }catch(e){}
+  if(!keepMsg) trkStatus('AUS');
+}
+
+/* Euler-Winkel aus der spaltenweise gespeicherten 4x4-Matrix */
+function poseFromMatrix(m){
+  const r02=m[8], r12=m[9], r22=m[10], r10=m[1], r11=m[5];
+  const yaw=Math.atan2(r02,r22);
+  const pitch=Math.asin(Math.max(-1,Math.min(1,-r12)));
+  const roll=Math.atan2(r10,r11);
+  return [yaw,pitch,roll];
+}
+
+/* Wiederverwendeter Puffer fuer die Blendshape-Namen (kein GC pro Frame) */
+const B={};
+for(const k of ['jawOpen','mouthClose','mouthSmileLeft','mouthSmileRight','mouthFrownLeft',
+  'mouthFrownRight','mouthPucker','mouthFunnel','eyeBlinkLeft','eyeBlinkRight',
+  'browOuterUpLeft','browOuterUpRight','browInnerUp','browDownLeft','browDownRight',
+  'eyeSquintLeft','eyeSquintRight','eyeWideLeft','eyeWideRight','mouthLeft','mouthRight',
+  'mouthShrugLower','mouthShrugUpper']) B[k]=0;
+
+function trackLoop(){
+  if(!TRACK.on) return;
+  const v=TRACK.video;
+  if(v&&v.readyState>=2&&TRACK.engine){
+    let ts=performance.now();
+    if(ts<=TRACK.lastTs) ts=TRACK.lastTs+1;
+    TRACK.lastTs=ts;
+    let res=null;
+    try{ res=TRACK.engine.detectForVideo(v,ts); }catch(e){}
+    const mats=res&&res.facialTransformationMatrixes;
+    if(mats&&mats.length){
+      const [yw,pt,rl]=poseFromMatrix(mats[0].data);
+      TRACK.rawYaw=yw; TRACK.rawPitch=pt; TRACK.rawRoll=rl;
+      /* Vorzeichen am Original geprueft:
+         MediaPipe liefert die Pose im Rohbild (nicht gespiegelt).
+         + yaw  = Nase zeigt im Rohbild nach rechts
+         + roll = Kopf im Rohbild gegen den Uhrzeigersinn geneigt
+         + pitch= Blick nach unten
+         Renderer: + yaw = Gesicht nach rechts, + roll = Kopf im
+         Uhrzeigersinn, - pitch = Blick nach unten.
+         Spiegelmodus dreht deshalb yaw um, roll nicht. */
+      const sYaw =TRACK.mirror?-1: 1;
+      const sRoll=TRACK.mirror? 1:-1;
+      TRACK.yaw  =clamp(sYaw*yw*TRACK.gainYaw,  -TRACK.maxYaw,  TRACK.maxYaw);
+      TRACK.pitch=clamp(-pt*TRACK.gainPitch,    -TRACK.maxPitch,TRACK.maxPitch);
+      TRACK.roll =clamp(sRoll*rl*TRACK.gainRoll,-TRACK.maxRoll, TRACK.maxRoll);
+      // Kopfversatz aus der Nasenposition im Bild
+      const lm=res.faceLandmarks&&res.faceLandmarks[0];
+      if(lm&&lm[1]){
+        const nx=(lm[1].x-0.5)*(TRACK.mirror?-1:1);
+        TRACK.shift=clamp(nx*TRACK.gainShift*4,-TRACK.maxShift,TRACK.maxShift);
+        // Bild -> Szene am Gesicht verankern (Groesse und Lage des Kopfes)
+        let mnx=1,mxx=0,sx=0,sy=0;
+        for(let i=0;i<lm.length;i++){ const q=lm[i];
+          if(q.x<mnx)mnx=q.x; if(q.x>mxx)mxx=q.x; sx+=q.x; sy+=q.y; }
+        MAP.asp=(v.videoHeight||480)/(v.videoWidth||640);
+        MAP.faceW=Math.max(0.05,mxx-mnx);
+        /* Massstabsgetreu: Gesichtsbreite der Kamera = Gesichtsbreite des
+           Avatars. Nur so landet eine Hand an der Wange auch an der Wange. */
+        MAP.sc=(G.HW*0.985)/MAP.faceW*TRACK.handScale;
+        MAP.fx=sx/lm.length; MAP.fyR=sy/lm.length; MAP.fy=MAP.fyR*MAP.asp;
+        MAP.ok=true;
+      }
+      /* ---- Mimik aus den Blendshapes ----
+         MediaPipe benennt die Seiten aus Sicht der PERSON. Der Avatar
+         zeichnet Bildschirmseiten; im Spiegelmodus bleibt links links,
+         im Gegenueber-Modus werden die Seiten getauscht. */
+      const bs=res.faceBlendshapes&&res.faceBlendshapes[0];
+      if(bs&&bs.categories){
+        const m=B; for(const k in m) m[k]=0;
+        for(const c of bs.categories) m[c.categoryName]=c.score;
+        TRACK.blend=true;
+        const sw=TRACK.mirror?0:1;                     // 1 = Seiten tauschen
+        const L=(a,b)=>sw?b:a;
+        const jo=m.jawOpen||0, mc=m.mouthClose||0;
+        FT.jaw   =clamp(jo*(1-0.78*mc)*1.12,0,1);
+        FT.smile =clamp(((m.mouthSmileLeft+m.mouthSmileRight)*0.5
+                        -(m.mouthFrownLeft+m.mouthFrownRight)*0.35)*1.15,-0.4,1);
+        FT.pucker=clamp(m.mouthPucker,0,1);
+        FT.funnel=clamp(m.mouthFunnel,0,1);
+        FT.blinkL=clamp(L(m.eyeBlinkLeft,m.eyeBlinkRight)*1.25,0,1);
+        FT.blinkR=clamp(L(m.eyeBlinkRight,m.eyeBlinkLeft)*1.25,0,1);
+        const upL=L(m.browOuterUpLeft,m.browOuterUpRight)+m.browInnerUp*0.6;
+        const upR=L(m.browOuterUpRight,m.browOuterUpLeft)+m.browInnerUp*0.6;
+        const dnL=L(m.browDownLeft,m.browDownRight), dnR=L(m.browDownRight,m.browDownLeft);
+        FT.browL=clamp(upL-dnL,-1,1);
+        FT.browR=clamp(upR-dnR,-1,1);
+        FT.browIn=clamp(m.browInnerUp,0,1);
+        FT.squint=clamp((m.eyeSquintLeft+m.eyeSquintRight)*0.5,0,1);
+        FT.wide  =clamp((m.eyeWideLeft+m.eyeWideRight)*0.5,0,1);
+        const mr=m.mouthRight||0, ml=m.mouthLeft||0;
+        FT.mX=clamp(sw?(ml-mr):(mr-ml),-1,1);
+        FT.mY=clamp((m.mouthShrugLower||0)*0.4-(m.mouthShrugUpper||0)*0.3,-1,1);
+      }else TRACK.blend=false;
+
+      TRACK.hasFace=true; TRACK.lastSeen=performance.now();
+      if(camPose) camPose.innerHTML='<span>Y '+(yw*57.3).toFixed(0)+'&deg;</span>'+
+        '<span>P '+(pt*57.3).toFixed(0)+'&deg;</span><span>R '+(rl*57.3).toFixed(0)+'&deg;</span>'+
+        '<span>MUND '+(FACE.jaw*100|0)+'</span>'+
+        '<span>Z '+(HANDS[0].vis>0.1?HANDS[0].z.toFixed(2):(HANDS[1].vis>0.1?HANDS[1].z.toFixed(2):'–'))+'</span>';
+      trkStatus('AKTIV','#7ef0ff');
+    }else if(performance.now()-TRACK.lastSeen>600){
+      if(TRACK.hasFace) trkStatus('SUCHE GESICHT','#2e86bd');
+      TRACK.hasFace=false;
+    }
+    /* ---- Haende: Lage, Tiefe und Naehe zum Gesicht ----
+       Die Tiefe kommt aus dem Groessenverhaeltnis Handflaeche zu
+       Gesichtsbreite: eine Hand dicht vor der Kamera erscheint gross.
+       zRef ist die Ruhelage und kalibriert sich langsam selbst, damit
+       die Schaetzung nicht von den Koerperproportionen abhaengt. */
+    TRACK.hframe=(TRACK.hframe|0)+1;
+    const hActive=!!(HANDS[0].raw||HANDS[1].raw);
+    if(TRACK.handEngine&&MAP.ok&&(hActive||TRACK.hframe%3===0)){
+      let hr=null;
+      try{ hr=TRACK.handEngine.detectForVideo(v,ts+1); }catch(e){}
+      const found=[null,null], fz=[null,null], fd=[0,0], ff=[0,0];
+      const hands=hr&&hr.landmarks;
+      const asp=MAP.asp, fw=MAP.faceW;
+      if(hands){
+        for(const h of hands){
+          if(h.length<21) continue;
+          let full=true;
+          for(const q of h){ if(q.x<-0.01||q.x>1.01||q.y<-0.01||q.y>1.01){ full=false; break; } }
+          if(!full) continue;                      // nur vollstaendig sichtbare Haende
+          const palm=Math.hypot(h[0].x-h[9].x,(h[0].y-h[9].y)*asp);
+          const q=palm/fw;
+          let z=clamp(Math.log(Math.max(1e-3,q/TRACK.zRef))/0.55,-1,1);
+          if(Math.abs(z)<0.92)                      // Ruhelage langsam nachfuehren
+            TRACK.zRef=clamp(lerp(TRACK.zRef,q,0.0006),0.42,1.10);
+          let hx=0,hy=0;
+          for(let i=0;i<21;i++){ hx+=h[i].x; hy+=h[i].y; }
+          hx/=21; hy/=21;
+          const dxf=hx-MAP.fx, dyf=(hy-(MAP.fyR||0.4))*asp;
+          const dn=Math.hypot(dxf,dyf)/fw;          // Abstand in Gesichtsbreiten
+          const face=clamp((1.15-dn)/0.75,0,1)*(1-0.55*Math.abs(z));
+          const pts=new Array(21), pzs=new Float32Array(21);
+          /* z der Landmarken ist relativ zum Handgelenk und in x-Einheiten;
+             auf die Handflaeche normiert wird daraus ein brauchbares Mass
+             dafuer, welcher Finger nach vorne zeigt. */
+          for(let i=0;i<21;i++){
+            pts[i]=[mapX(h[i].x), mapY(h[i].y)];
+            pzs[i]=clamp((h[i].z||0)/Math.max(1e-3,palm),-1.6,1.6);
+          }
+          const idx=pts[0][0]<G.cx?0:1;            // Seite nach Bildschirmlage
+          const put=found[idx]?(idx^1):idx;
+          found[put]=pts; fz[put]=pzs; fd[put]=z; ff[put]=face;
+        }
+      }
+      for(let i=0;i<2;i++){
+        HANDS[i].raw=found[i]; HANDS[i].rawz=fz[i];
+        if(found[i]){ HANDS[i].zRaw=fd[i]; HANDS[i].faceRaw=ff[i]; }
+        else { HANDS[i].faceRaw=0; }
+      }
+    }
+  }
+  requestAnimationFrame(trackLoop);
+}
+function toggleTracking(){ TRACK.on?trackingOff():trackingOn(); }
+function toggleMirror(){
+  TRACK.mirror=!TRACK.mirror;
+  trkStatus(TRACK.mirror?'SPIEGEL':'GEGENUEBER','#7ef0ff');
+  clearTimeout(toggleMirror._t);
+  toggleMirror._t=setTimeout(()=>{
+    if(TRACK.on) trkStatus(TRACK.hasFace?'AKTIV':'SUCHE GESICHT',TRACK.hasFace?'#7ef0ff':'#2e86bd');
+    else if(!TRACK.ext) trkStatus('AUS');
+  },1400);
+}
+
+/* ==========================================================
+   9 · EINGABE + API
+   ========================================================== */
+const ORDER=['idle','listening','speaking'];
+function cycle(){
+  S.demo=true;
+  const next=ORDER[(ORDER.indexOf(S.state)+1)%ORDER.length];
+  if(next==='speaking') say(PHRASES[S.pi++%PHRASES.length]); else setState(next);
+  S.nextDemo=performance.now()+4500;
+}
+addEventListener('pointerdown',e=>{ if(e.target.closest('.ui'))return; cycle(); });
+addEventListener('keydown',e=>{
+  if(e.code==='Space'){e.preventDefault();cycle();}
+  else if(e.key==='m'||e.key==='M')toggleMic();
+  else if(e.key==='t'||e.key==='T')toggleTracking();
+  else if(e.key==='k'||e.key==='K')toggleMirror();
+  else if(e.key==='h'||e.key==='H')document.body.classList.toggle('hide-ui');
+});
+window.JARVIS={setState,setLevel(v){S.demo=false;S.level=clamp(+v||0,0,1);},say,
+  pulse(){S.ringPulse=1;},get state(){return S.state;},
+  tracking:TRACK, startTracking:trackingOn, stopTracking:trackingOff,
+  /* Haende von aussen setzen: Liste von je 21 [x,y] oder [x,y,z] in
+     Bildkoordinaten 0..1. Die Tiefe wird wie beim Kameratracking aus dem
+     Verhaeltnis Handflaeche zu Gesichtsbreite geschaetzt. */
+  setHands(list,faceBox){
+    if(faceBox){ MAP.asp=faceBox.asp||0.75; MAP.faceW=faceBox.w;
+                 MAP.sc=(G.HW*0.985)/faceBox.w*TRACK.handScale;
+                 MAP.fx=faceBox.cx; MAP.fyR=faceBox.cy; MAP.fy=faceBox.cy*MAP.asp;
+                 MAP.ok=true; }
+    const found=[null,null], fz=[null,null], fd=[0,0], ff=[0,0];
+    const asp=MAP.asp, fw=Math.max(0.05,MAP.faceW);
+    for(const h of (list||[])){
+      if(!h||h.length<21) continue;
+      const palm=Math.hypot(h[0][0]-h[9][0],(h[0][1]-h[9][1])*asp);
+      const z=clamp(Math.log(Math.max(1e-3,(palm/fw)/TRACK.zRef))/0.55,-1,1);
+      let hx=0,hy=0; for(let i=0;i<21;i++){ hx+=h[i][0]; hy+=h[i][1]; }
+      hx/=21; hy/=21;
+      const dn=Math.hypot(hx-MAP.fx,(hy-(MAP.fyR||0.4))*asp)/fw;
+      const pts=new Array(21), pzs=new Float32Array(21);
+      for(let i=0;i<21;i++){
+        pts[i]=[mapX(h[i][0]),mapY(h[i][1])];
+        pzs[i]=clamp((h[i][2]||0)/Math.max(1e-3,palm),-1.6,1.6);
+      }
+      const idx=pts[0][0]<G.cx?0:1;
+      const put=found[idx]?(idx^1):idx;
+      found[put]=pts; fz[put]=pzs; fd[put]=z;
+      ff[put]=clamp((1.15-dn)/0.75,0,1)*(1-0.55*Math.abs(z));
+    }
+    for(let i=0;i<2;i++){
+      HANDS[i].raw=found[i]; HANDS[i].rawz=fz[i];
+      if(found[i]){ HANDS[i].zRaw=fd[i]; HANDS[i].faceRaw=ff[i]; } else HANDS[i].faceRaw=0;
+    }
+  },
+  /* Mimik von aussen setzen (0..1, Seiten sind Bildschirmseiten):
+     {jaw,smile,pucker,funnel,blinkL,blinkR,browL,browR,browIn,mX,mY} */
+  setFace(o){
+    TRACK.blend=true; TRACK.ext=true; TRACK.hasFace=true;
+    TRACK.lastSeen=performance.now();
+    for(const k in (o||{})) if(k in FT) FT[k]=+o[k]||0;
+  },
+  get face(){ return FACE; },
+  get breath(){ return BR; },
+  get hands(){ return HANDS; },
+  /* Pose von aussen setzen (Bogenmass) - zum Testen oder fuer eigene Tracker */
+  setPose(yaw,pitch,roll,shift){
+    TRACK.ext=true; TRACK.hasFace=true; TRACK.lastSeen=performance.now();
+    if(!TRACK.on) trkStatus('EXTERN','#7ef0ff');
+    TRACK.yaw=clamp(+yaw||0,-TRACK.maxYaw,TRACK.maxYaw);
+    TRACK.pitch=clamp(+pitch||0,-TRACK.maxPitch,TRACK.maxPitch);
+    TRACK.roll=clamp(+roll||0,-TRACK.maxRoll,TRACK.maxRoll);
+    TRACK.shift=clamp(+shift||0,-TRACK.maxShift,TRACK.maxShift);
+  }};
+
+/* Einstellungen per URL: ?track=1 startet sofort, ?mirror=0 dreht die Richtung */
+(function(){
+  const q=new URLSearchParams(location.search);
+  if(q.get('mirror')==='0') TRACK.mirror=false;
+  if(q.has('gain')) TRACK.gainYaw=parseFloat(q.get('gain'))||TRACK.gainYaw;
+  if(q.has('hand')) TRACK.handScale=parseFloat(q.get('hand'))||TRACK.handScale;
+  if(q.has('breath')) BR.amp=parseFloat(q.get('breath'));
+  let want=q.get('track')==='1';
+  try{ if(localStorage.getItem('jarvis.track')==='1') want=true; }catch(e){}
+  if(want){
+    // Erlaubnis liegt meist schon vor -> direkt versuchen, sonst beim ersten Klick
+    setTimeout(trackingOn,500);
+    addEventListener('pointerdown',trackingOn,{once:true});
+  }
+})();
+
+
+/* --- Vergleichs-Overlay: ?ref=1 blendet die Vorlage lagerichtig ein.
+       Messwerte der Vorlage: Kopfmitte x=578, Scheitel y=596, Kopfbreite 556 --- */
+(function(){
+  const q=new URLSearchParams(location.search);
+  if(!q.has('ref')) return;
+  const img=document.getElementById('refimg');
+  img.src='ref.png';
+  img.style.display='block';
+  img.style.opacity=q.get('ref')||'0.5';
+  const place=()=>{
+    const k=(G.HW/DPR)/556;
+    img.style.width=(1206*k)+'px';
+    img.style.left=((G.cx/DPR)-578*k)+'px';
+    img.style.top=((G.crownY/DPR)-596*k)+'px';
+  };
+  place(); addEventListener('resize',()=>setTimeout(place,60));
+  setInterval(place,500);
+})();
+resize(); setState('idle'); S.nextDemo=performance.now()+1400;
+requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
