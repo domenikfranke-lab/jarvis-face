@@ -2,8 +2,13 @@
 
 **Datei:** `~/Public/Claudes_Workspace/jarvis-face/index.html` (eigenständig, kein Build)
 **Artifact:** https://claude.ai/artifact/2rzpezz4ZmQXYWEshhmXst (Kopie ohne html/head/body-Wrapper, Stand ist älter)
-**Starten:** `cd ~/Public/Claudes_Workspace/jarvis-face && python3 serve.py 8901`
-→ http://localhost:8901/index.html (Kamera braucht http, über `file://` blockt Chrome das Modell)
+**Live (HTTPS, remote):** https://domenikfranke-lab.github.io/jarvis-face/
+**Repo:** https://github.com/domenikfranke-lab/jarvis-face (public — Pages ist sonst kostenpflichtig)
+**Lokal starten:** `cd ~/Public/Claudes_Workspace/jarvis-face && python3 serve.py 8901`
+→ http://localhost:8901/index.html (Kamera braucht http bzw. https, über `file://` blockt Chrome das Modell)
+**Deployen:** `./deploy.sh "Was geaendert wurde"` — kopiert nach `~/Developer/jarvis-face-pages`
+und pusht. Der Klon liegt bewusst ausserhalb des Vaults, sonst landet `.git` im Drive-Sync.
+`ref.png` ist absichtlich nicht im Repo: Standbild aus einem fremden Instagram-Reel.
 
 `serve.py` statt `python3 -m http.server`: der eingebaute Server cacht, und der
 Browser zeigte dadurch minutenlang alte Stände. `serve.py` schickt `no-store`.
