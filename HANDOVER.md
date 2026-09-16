@@ -76,8 +76,40 @@ Arme, Schultergelenk und die Zweiknochen-IK sind **raus** — nur noch Hände.
   `?hand=0.85` staucht, falls die Hände zu weit nach außen laufen.
 - Handerkennung läuft jedes Bild, solange eine Hand sichtbar ist, sonst jedes dritte.
 
+## Leistung — was gebremst hat und was hilft
+Mit Kamera lief es zäh. Drei Ursachen, alle behoben:
+
+1. **Bloom lief auf voller Fläche.** Drei `ctx.filter='blur(...)'`-Durchgänge über die
+   ganze Leinwand, der weiteste mit 20 px. Jetzt werden die beiden weiten Stufen auf
+   dem 1/4-Puffer unscharf gerechnet (1/16 der Pixel) und ohne Filter hochgezogen,
+   die enge Stufe braucht gar keinen Filter mehr — das Hochskalieren weicht sie schon
+   auf. Es gibt keinen einzigen Vollbild-Filter mehr. Der Look ist dabei gleich
+   geblieben, gegengeprüft mit identischen Einstellungen.
+2. **Kein Pixelbudget.** Auf einem Retina-Bildschirm waren es schnell 6 Mpx, und
+   Partikel, Bloom und Compositing zahlen das alle mit. Budget jetzt 2.6 Mpx
+   (`PXBUDGET`, `?px=4` hebt es an), `RS` regelt zusätzlich nach.
+3. **Beide Modelle liefen bei jedem Bild** — die Handerkennung sogar durchgehend,
+   sobald eine Hand sichtbar war (das war mein Fehler aus der Runde davor).
+   Jetzt hat jedes Modell eine eigene Taktrate, Gesicht 26 Hz, Hände 13 Hz, und sie
+   teilen sich nie dasselbe Bild. Pose und Landmarken werden ohnehin geglättet.
+
+**Falle beim Takten:** fester Vorrang fürs Gesicht lässt die Hände verhungern, sobald
+die Bildrate in die Nähe der Gesichtsrate kommt (gemessen: 0 Handerkennungen pro
+Sekunde). Es wird deshalb der relativ am weitesten Überfällige gewählt, nicht der
+Wichtigere.
+
+**Selbstregler** misst jetzt die echte Bildrate, nicht mehr nur die Zeichenzeit —
+die Modelle laufen auf demselben Thread und tauchten vorher nirgends auf.
+Reihenfolge beim Sparen: erst Auflösung (`RS`, kostet überall), dann Partikeldichte
+(`QUALITY`), dann die Taktrate der Erkennung. Zurückgeregelt wird unter 18.5 ms —
+eine Schwelle unter 16.7 ms würde bei 60 Hz nie auslösen.
+
+**Taste `P`** blendet die Messwerte ein: Bildrate, Zeichenzeit, Gesicht und Hände je
+in ms und Hz, Fläche, RS und QUALITY. `?perf=1` schaltet sie beim Start ein.
+Wenn es wieder klemmt: dort ablesen, welche Zeile groß ist.
+
 ## Steuerung
-`SPACE` Zustand · `M` Mikrofon · `T` Kamera (Kopf·Mimik·Hände) · `K` Richtung · `H` UI aus
+`SPACE` Zustand · `M` Mikrofon · `T` Kamera (Kopf·Mimik·Hände) · `K` Richtung · `P` Messwerte · `H` UI aus
 
 ## JS-API
 ```js
@@ -94,6 +126,7 @@ JARVIS.face / .breath / .hands                // Lesezugriff auf den Zustand
 ## URL-Parameter
 `?track=1` Tracking sofort · `?mirror=0` Richtung umdrehen · `?gain=1.3` Yaw-Verstärkung
 `?hand=0.85` Hand-Maßstab · `?breath=0.6` Atem-Amplitude · `?ref=0.5` Originalframe als Overlay
+`?px=4` Pixelbudget in Mpx · `?facehz=20` / `?handhz=10` Taktrate der Erkennung · `?perf=1` Messwerte an
 
 ## Fallen, die schon Zeit gekostet haben
 1. **Cache.** Gelöst durch `serve.py` (no-store). Wer doch `-m http.server` nimmt:

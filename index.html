@@ -99,6 +99,15 @@
 </head>
 <body>
 <canvas id="stage"></canvas>
+<style>
+#perf{position:fixed;left:14px;bottom:14px;z-index:40;display:none;
+  font:11px/1.55 ui-monospace,SFMono-Regular,Menlo,monospace;color:#7ef0ff;
+  background:rgba(2,10,24,.72);border:1px solid rgba(23,95,146,.5);
+  border-radius:6px;padding:7px 10px;letter-spacing:.06em;pointer-events:none;
+  white-space:pre}
+#perf b{color:#f3b23a;font-weight:600}
+body.perf #perf{display:block}
+</style>
 <div id="scan"></div>
 <div id="vig"></div>
 <div class="ui" id="brand">J A R V I S<small>NEURAL INTERFACE v2</small></div>
@@ -109,8 +118,9 @@
 </div>
 <div id="cam"><video id="camVid" playsinline muted></video><div id="camPose"></div></div>
 <div class="ui" id="meter"><div class="lbl">INPUT</div><div class="bars" id="bars"></div></div>
-<div class="ui" id="hint">SPACE · ZUSTAND<br>M · MIKROFON<br>T · KAMERA (KOPF·MIMIK·HAENDE)<br>K · RICHTUNG<br>H · UI</div>
+<div class="ui" id="hint">SPACE · ZUSTAND<br>M · MIKROFON<br>T · KAMERA (KOPF·MIMIK·HAENDE)<br>K · RICHTUNG<br>P · MESSWERTE<br>H · UI</div>
 <div class="ui" id="caption"></div>
+<div id="perf"></div>
 <img id="refimg" alt="" style="position:fixed;pointer-events:none;z-index:9;display:none;opacity:.5;mix-blend-mode:screen">
 
 <script>
@@ -124,8 +134,14 @@ const cv=document.getElementById('stage');
 const ctx=cv.getContext('2d',{alpha:false});
 const scene=document.createElement('canvas'), sctx=scene.getContext('2d');
 const glow=document.createElement('canvas'),  gctx=glow.getContext('2d');
+/* Bloom wird auf den kleinen Puffern unscharf gerechnet und erst danach
+   hochskaliert. Ein blur(20px) auf der vollen Flaeche kostete ein Vielfaches. */
+const glowA=document.createElement('canvas'), gactx=glowA.getContext('2d');
+const glowB=document.createElement('canvas'), gbctx=glowB.getContext('2d');
 let W=0,H=0,DPR=1,U=1,GW=0,GH=0;
 const GS=4;
+const BLUR_A='blur('+(5/4).toFixed(2)+'px)';    // entspricht 5px in Zielaufloesung
+const BLUR_B='blur('+(20/4).toFixed(2)+'px)';   // entspricht 20px
 let QUALITY=1;
 
 const rnd=(a,b)=>a+Math.random()*(b-a);
@@ -148,14 +164,23 @@ for(let i=0;i<=SINN;i++) SINT[i]=Math.sin(i/SINN*6.283185307179586);
 const INV_TAU=SINN/6.283185307179586;
 function fsin(x){ let i=(x*INV_TAU)|0; i%=SINN; if(i<0)i+=SINN; return SINT[i]; }
 
+/* Pixelbudget: auf einem Retina-Bildschirm waeren es sonst schnell 6 Mpx,
+   und jede Stufe (Partikel, Bloom, Compositing) zahlt das voll mit.
+   Die Szene ist Glut und Leuchtpunkte - die Skalierung sieht man kaum.
+   RS wird vom Selbstregler nachgezogen, ?px=4 hebt das Budget an. */
+let PXBUDGET=2.6e6, RS=1;
 function resize(){
-  DPR=Math.min(window.devicePixelRatio||1,2);
+  const dpr=Math.min(window.devicePixelRatio||1,2);
+  const full=innerWidth*dpr*innerHeight*dpr;
+  const fit=Math.min(1,Math.sqrt(PXBUDGET/Math.max(1,full)));
+  DPR=Math.max(0.75,dpr*fit*RS);
   W=Math.max(2,Math.floor(innerWidth*DPR));
   H=Math.max(2,Math.floor(innerHeight*DPR));
   cv.width=scene.width=W; cv.height=scene.height=H;
   cv.style.width=innerWidth+'px'; cv.style.height=innerHeight+'px';
   GW=Math.max(2,(W/GS)|0); GH=Math.max(2,(H/GS)|0);
-  glow.width=GW; glow.height=GH;
+  glow.width=glowA.width=glowB.width=GW;
+  glow.height=glowA.height=glowB.height=GH;
   U=DPR;
   build();
 }
@@ -1025,9 +1050,11 @@ function drawRings(c,t,lvl){
 /* ==========================================================
    7 · LOOP
    ========================================================== */
-let last=performance.now(), ftAvg=16, qCheck=0;
+let last=performance.now(), ftAvg=16, qCheck=0, frAvg=16;
 function frame(now){
-  const dt=Math.min(0.05,(now-last)/1000); last=now; S.t+=dt;
+  const raw=now-last;
+  const dt=Math.min(0.05,raw/1000); last=now; S.t+=dt;
+  if(raw>0&&raw<400) frAvg=lerp(frAvg,raw,0.06);
   demoDrive(now); micDrive(); tickCaption(now); updatePose(dt); updateHands(dt);
   S.levelS=lerp(S.levelS,S.level,1-Math.pow(0.0018,dt));
   updateBreath(dt,S.levelS); updateFace(dt,S.levelS);
@@ -1056,14 +1083,18 @@ function frame(now){
   flush(sctx); TARGET=null;
   drawVeins(sctx,t,lvl);
 
-  gctx.globalCompositeOperation='source-over'; gctx.clearRect(0,0,GW,GH);
-  gctx.drawImage(scene,0,0,GW,GH);
+  /* Szene auf 1/4 verkleinern, die beiden weiten Bloom-Stufen dort unscharf
+     rechnen (1/16 der Pixel) und ohne Filter hochziehen. Die enge Stufe
+     braucht gar keinen Filter mehr - das Hochskalieren weicht sie schon auf. */
+  gctx.clearRect(0,0,GW,GH); gctx.drawImage(scene,0,0,GW,GH);
+  gactx.clearRect(0,0,GW,GH); gactx.filter=BLUR_A; gactx.drawImage(glow,0,0); gactx.filter='none';
+  gbctx.clearRect(0,0,GW,GH); gbctx.filter=BLUR_B; gbctx.drawImage(glow,0,0); gbctx.filter='none';
 
   ctx.globalCompositeOperation='lighter';
-  ctx.filter='blur(1.6px)'; ctx.globalAlpha=0.95+0.30*lvl; ctx.drawImage(glow,0,0,W,H);
-  ctx.filter='blur(5px)';   ctx.globalAlpha=0.72+0.40*lvl; ctx.drawImage(glow,0,0,W,H);
-  ctx.filter='blur(20px)'; ctx.globalAlpha=0.62+0.48*lvl; ctx.drawImage(glow,0,0,W,H);
-  ctx.filter='none'; ctx.globalAlpha=1; ctx.drawImage(scene,0,0);
+  ctx.globalAlpha=0.95+0.30*lvl; ctx.drawImage(glow ,0,0,W,H);
+  ctx.globalAlpha=0.72+0.40*lvl; ctx.drawImage(glowA,0,0,W,H);
+  ctx.globalAlpha=0.62+0.48*lvl; ctx.drawImage(glowB,0,0,W,H);
+  ctx.globalAlpha=1; ctx.drawImage(scene,0,0);
   ctx.globalCompositeOperation='source-over';
 
   for(let i=0;i<BAR_N;i++){
@@ -1076,11 +1107,25 @@ function frame(now){
   }
 
   ftAvg=lerp(ftAvg,performance.now()-t0,0.05);
-  if(now-qCheck>2500){
+  if(now-qCheck>2200){
     qCheck=now;
-    if(ftAvg>19&&QUALITY>0.5){ QUALITY=Math.max(0.5,QUALITY-0.18); build(); }
-    else if(ftAvg<8&&QUALITY<1.2){ QUALITY=Math.min(1.2,QUALITY+0.12); build(); }
+    /* Gemessen wird die echte Bildrate, nicht nur die Zeichenzeit - die
+       Modelle laufen auf demselben Thread und tauchten vorher nirgends auf.
+       Reihenfolge beim Sparen: Aufloesung (kostet ueberall), dann Dichte,
+       dann die Taktrate der Erkennung. */
+    if(frAvg>23){
+      if(RS>0.62){ RS=Math.max(0.62,RS-0.12); resize(); }
+      else if(QUALITY>0.5){ QUALITY=Math.max(0.5,QUALITY-0.18); build(); }
+      else if(TRACK.on&&DET.handHz>7){ DET.handHz=Math.max(7,DET.handHz-3); DET.faceHz=Math.max(18,DET.faceHz-4); }
+    }else if(frAvg<18.5){   /* 18.5 ms = gut 54 fps. Bei 60 Hz ist 16.7 ms das
+                               Beste, was es gibt - eine Schwelle unter 16.7
+                               wuerde nie ausloesen und nie zurueckregeln. */
+      if(DET.handHz<DET.handHz0){ DET.handHz=Math.min(DET.handHz0,DET.handHz+2); DET.faceHz=Math.min(DET.faceHz0,DET.faceHz+3); }
+      else if(QUALITY<1.0){ QUALITY=Math.min(1.0,QUALITY+0.10); build(); }
+      else if(RS<1){ RS=Math.min(1,RS+0.08); resize(); }
+    }
   }
+  if(perfOn&&now-perfT>280){ perfT=now; drawPerf(); }
   requestAnimationFrame(frame);
 }
 
@@ -1332,13 +1377,20 @@ for(const k of ['jawOpen','mouthClose','mouthSmileLeft','mouthSmileRight','mouth
   'eyeSquintLeft','eyeSquintRight','eyeWideLeft','eyeWideRight','mouthLeft','mouthRight',
   'mouthShrugLower','mouthShrugUpper']) B[k]=0;
 
-function trackLoop(){
-  if(!TRACK.on) return;
-  const v=TRACK.video;
-  if(v&&v.readyState>=2&&TRACK.engine){
-    let ts=performance.now();
-    if(ts<=TRACK.lastTs) ts=TRACK.lastTs+1;
-    TRACK.lastTs=ts;
+/* Beide Modelle laufen auf dem Hauptthread. Vorher lief die Gesichts-
+   erkennung bei jedem Bild und die Handerkennung ebenso, sobald eine Hand
+   sichtbar war - zusammen mehr als ein Bildbudget. Jetzt haben beide eine
+   eigene Taktrate und teilen sich nie dasselbe Bild. Pose und Landmarken
+   werden ohnehin geglaettet, von der niedrigeren Rate sieht man nichts. */
+const DET={faceHz:26, handHz:13, faceHz0:26, handHz0:13,
+           tFace:-1e9, tHand:-1e9, msFace:0, msHand:0, hTs:0};
+
+function detectFace(v){
+  let ts=performance.now();
+  if(ts<=TRACK.lastTs) ts=TRACK.lastTs+1;
+  TRACK.lastTs=ts;
+  const t0=performance.now();
+  {
     let res=null;
     try{ res=TRACK.engine.detectForVideo(v,ts); }catch(e){}
     const mats=res&&res.facialTransformationMatrixes;
@@ -1417,16 +1469,24 @@ function trackLoop(){
       if(TRACK.hasFace) trkStatus('SUCHE GESICHT','#2e86bd');
       TRACK.hasFace=false;
     }
+  }
+  DET.msFace=lerp(DET.msFace,performance.now()-t0,0.15);
+}
+
+function detectHands(v){
+  const t0=performance.now();
+  {
     /* ---- Haende: Lage, Tiefe und Naehe zum Gesicht ----
        Die Tiefe kommt aus dem Groessenverhaeltnis Handflaeche zu
        Gesichtsbreite: eine Hand dicht vor der Kamera erscheint gross.
        zRef ist die Ruhelage und kalibriert sich langsam selbst, damit
        die Schaetzung nicht von den Koerperproportionen abhaengt. */
-    TRACK.hframe=(TRACK.hframe|0)+1;
-    const hActive=!!(HANDS[0].raw||HANDS[1].raw);
-    if(TRACK.handEngine&&MAP.ok&&(hActive||TRACK.hframe%3===0)){
+    {
+      let ts=performance.now();
+      if(ts<=DET.hTs) ts=DET.hTs+1;
+      DET.hTs=ts;
       let hr=null;
-      try{ hr=TRACK.handEngine.detectForVideo(v,ts+1); }catch(e){}
+      try{ hr=TRACK.handEngine.detectForVideo(v,ts); }catch(e){}
       const found=[null,null], fz=[null,null], fd=[0,0], ff=[0,0];
       const hands=hr&&hr.landmarks;
       const asp=MAP.asp, fw=MAP.faceW;
@@ -1467,7 +1527,22 @@ function trackLoop(){
       }
     }
   }
+  DET.msHand=lerp(DET.msHand,performance.now()-t0,0.15);
+}
+
+function trackLoop(){
+  if(!TRACK.on) return;
   requestAnimationFrame(trackLoop);
+  const v=TRACK.video;
+  if(!(v&&v.readyState>=2&&TRACK.engine)) return;
+  const now=performance.now();
+  /* Wer ist relativ zu seiner Sollrate am weitesten ueberfaellig? Fester
+     Vorrang fuers Gesicht hat die Haende verhungern lassen, sobald die
+     Bildrate in die Naehe der Gesichtsrate kam. */
+  const dF=(now-DET.tFace)*DET.faceHz;
+  const dH=(TRACK.handEngine&&MAP.ok)?(now-DET.tHand)*DET.handHz:-1;
+  if(dH>=1000&&dH>=dF){ DET.tHand=now; detectHands(v); }
+  else if(dF>=1000){ DET.tFace=now; detectFace(v); }
 }
 function toggleTracking(){ TRACK.on?trackingOff():trackingOn(); }
 function toggleMirror(){
@@ -1483,6 +1558,21 @@ function toggleMirror(){
 /* ==========================================================
    9 · EINGABE + API
    ========================================================== */
+/* Messanzeige (Taste P). Zeigt die echte Bildrate und wo die Zeit hingeht. */
+let perfOn=false, perfT=0;
+const perfEl=document.getElementById('perf');
+function drawPerf(){
+  const fps=1000/Math.max(1,frAvg);
+  const warn=v=>v>23?'<b>'+v.toFixed(1)+'</b>':v.toFixed(1);
+  perfEl.innerHTML=
+    'BILDRATE   '+warn(frAvg)+' ms  ('+fps.toFixed(0)+' fps)\n'+
+    'ZEICHNEN   '+ftAvg.toFixed(1)+' ms\n'+
+    'GESICHT    '+(TRACK.on?DET.msFace.toFixed(1)+' ms @ '+DET.faceHz+' Hz':'aus')+'\n'+
+    'HAENDE     '+(TRACK.on&&TRACK.handEngine?DET.msHand.toFixed(1)+' ms @ '+DET.handHz+' Hz':'aus')+'\n'+
+    'FLAECHE    '+W+'x'+H+'  ('+(W*H/1e6).toFixed(2)+' Mpx)\n'+
+    'RS '+RS.toFixed(2)+'   QUALITY '+QUALITY.toFixed(2);
+}
+
 const ORDER=['idle','listening','speaking'];
 function cycle(){
   S.demo=true;
@@ -1497,6 +1587,7 @@ addEventListener('keydown',e=>{
   else if(e.key==='t'||e.key==='T')toggleTracking();
   else if(e.key==='k'||e.key==='K')toggleMirror();
   else if(e.key==='h'||e.key==='H')document.body.classList.toggle('hide-ui');
+  else if(e.key==='p'||e.key==='P'){ perfOn=!perfOn; document.body.classList.toggle('perf',perfOn); }
 });
 window.JARVIS={setState,setLevel(v){S.demo=false;S.level=clamp(+v||0,0,1);},say,
   pulse(){S.ringPulse=1;},get state(){return S.state;},
@@ -1560,6 +1651,10 @@ window.JARVIS={setState,setLevel(v){S.demo=false;S.level=clamp(+v||0,0,1);},say,
   if(q.has('gain')) TRACK.gainYaw=parseFloat(q.get('gain'))||TRACK.gainYaw;
   if(q.has('hand')) TRACK.handScale=parseFloat(q.get('hand'))||TRACK.handScale;
   if(q.has('breath')) BR.amp=parseFloat(q.get('breath'));
+  if(q.has('px')){ PXBUDGET=(parseFloat(q.get('px'))||2.6)*1e6; resize(); }
+  if(q.has('facehz')) DET.faceHz=DET.faceHz0=clamp(parseFloat(q.get('facehz'))||26,5,60);
+  if(q.has('handhz')) DET.handHz=DET.handHz0=clamp(parseFloat(q.get('handhz'))||13,3,60);
+  if(q.get('perf')==='1'){ perfOn=true; document.body.classList.add('perf'); }
   let want=q.get('track')==='1';
   try{ if(localStorage.getItem('jarvis.track')==='1') want=true; }catch(e){}
   if(want){
